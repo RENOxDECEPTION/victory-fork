@@ -2853,6 +2853,9 @@ mod fill_ahead {
         if len == 0 {
             return;
         }
+        // What lands under it must come back for the check
+        // (`VICTORY_OWN=wc` would leave it on the card).
+        crate::shadow::own_read(src, len);
         COUNT[0].fetch_add(1, Relaxed);
         let frame = crate::frame::current();
         let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
@@ -4732,6 +4735,7 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
                             && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                            && !r.shadow.own_skip(r.declared, lo, hi)
                             && seen.insert((copy, lo, hi))
                         {
                             pieces.push((r.shadow.clone(), lo, hi, total));
@@ -5186,6 +5190,7 @@ impl Host {
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi
                     && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                    && !r.shadow.own_skip(r.declared, lo, hi)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
                     pieces.push((i, lo, hi, total));
@@ -5310,6 +5315,107 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
             let _ = (from, to);
+        }
+    }
+
+    /// With [`crate::census::own_wc`], before a submission's steps run, on
+    /// the submitting thread under the submission lock: the pages whose
+    /// newer bytes stayed on the card that a step reads on the CPU (the
+    /// title's buffer copies and fills read their source, a texture's
+    /// refresh its memory, a copy's refresh what another copy owns), and
+    /// those readers that cannot wait asked for since the last submission
+    /// (`crate::shadow::own_read`), are fetched and merged into title
+    /// memory (`Shadow::own_land`) before anything reads them. The flights
+    /// in the air are settled first, so that the card has run every write
+    /// of theirs and nothing lands meanwhile; the fetch is then the one of
+    /// [`Host::card_back`], on the direct queue, behind everything sent.
+    /// Those pages are not left on the card again.
+    fn own_ensure(&self, runs: &[&HostList], submitted: &mut u64) {
+        use crate::census::{OwnCount, own_count};
+        crate::census::own_say();
+        let mut reads: Vec<(usize, usize, u64)> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                match step {
+                    &Step::Copy(_, src, len) | &Step::Fill(_, src, len) => reads.push((src, src + len, 0)),
+                    Step::Texture(staging) => {
+                        let (at, len) = staging.memory();
+                        reads.push((at, at + len, 0));
+                    }
+                    Step::Refresh(shadow, address, len) => reads.push((*address, *address + *len, shadow.id())),
+                    // `Run` (the title's memory copies) and the one `Host`
+                    // step that reads title memory (rectangle vertices) ask
+                    // when recorded (`crate::shadow::own_read`).
+                    Step::Run(_) | Step::Host(_) | Step::GpuWrite(..) => {}
+                }
+            }
+        }
+        let hits = crate::shadow::own_hits(&reads);
+        if hits.is_empty() {
+            return;
+        }
+        own_count(OwnCount::Settles, 1);
+        self.settle(submitted, WHY_READ);
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> = Vec::new();
+        let mut total = 0u64;
+        for (shadow, page) in hits {
+            let (lo, hi) = shadow.own_piece(page);
+            if lo < hi {
+                pieces.push((shadow, page, lo, hi, total));
+                total += (hi - lo) as u64;
+            }
+        }
+        if pieces.is_empty() {
+            return;
+        }
+        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(work) = work.as_mut() else {
+            fail(format_args!("no list to fetch what shaders left in the card's memory (VICTORY_OWN=wc)"));
+        };
+        if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
+            let size = total.next_multiple_of(16 << 20);
+            work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        }
+        let Some((fetched, data, _)) = &work.fetched else {
+            fail(format_args!("no memory to fetch what shaders left in the card's memory ({total} bytes, VICTORY_OWN=wc)"));
+        };
+        let waiting = std::time::Instant::now();
+        let (allocator, list) = &work.fetch;
+        // SAFETY: the list's last run was waited for (`card_back`, or here);
+        // live buffers (the copies are held by `pieces`); the fence and
+        // event are ours, under the submission lock, and nothing is in the
+        // air (settled above).
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                for (shadow, _, lo, hi, at) in &pieces {
+                    list.CopyBufferRegion(fetched, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                self.card_sent();
+                *submitted += 1;
+                self.queue.Signal(&self.fence, *submitted)?;
+                self.fence.SetEventOnCompletion(*submitted, self.event)?;
+                let was_working = working(false);
+                WaitForSingleObject(self.event, INFINITE);
+                stood(waiting);
+                working(was_working);
+                Ok(())
+            })()
+        };
+        if let Err(e) = ran {
+            fail(format_args!("what shaders left in the card's memory could not be fetched ({e}, VICTORY_OWN=wc)"));
+        }
+        let mut title = Vec::new();
+        for (shadow, page, lo, hi, at) in &pieces {
+            // SAFETY: the mapping of the fetched bytes, `total` of them; the
+            // copy into it has run.
+            let gpu = unsafe { std::slice::from_raw_parts((*data + *at as usize) as *const u8, *hi - *lo) };
+            shadow.own_land(*page, *lo, gpu, &mut title);
+            own_count(OwnCount::Fetched, 1);
+            own_count(OwnCount::FetchedBytes, (*hi - *lo) as u64);
         }
     }
 
@@ -5584,6 +5690,11 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+        }
+        // What shaders wrote and left on the card that the steps below read
+        // on the CPU (`VICTORY_OWN=wc`).
+        if crate::census::own_wc() {
+            self.own_ensure(runs, &mut submitted);
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.

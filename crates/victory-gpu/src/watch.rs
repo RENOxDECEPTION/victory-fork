@@ -1253,6 +1253,7 @@ pub(crate) fn fault_write(at: usize) -> bool {
 /// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`
 /// with `MEM_COMMIT`): its blocks are no longer absent.
 pub fn title_memory_committed(at: usize, len: usize) {
+    crate::shadow::own_forget(at, len);
     let mut g = guards();
     if g.absent.is_empty() {
         return;
@@ -1536,6 +1537,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
+    // Nor are the card's bytes newer there (`VICTORY_OWN=wc`).
+    crate::shadow::own_forget(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();

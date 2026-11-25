@@ -178,6 +178,20 @@ fn mirror(handle: u64) {
 /// slots a frame in the world of the title this fork works on, against a
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
+/// Whether title memory `[at, at + len)` holds part of a shader-visible
+/// descriptor heap. `VICTORY_OWN=wc` leaves no such piece on the card: what
+/// shaders wrote there would never reach [`sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at.saturating_add(len) as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| start < to && end > from)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn in_shader_heap(_at: usize, _len: usize) -> bool {
+    false
+}
+
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {

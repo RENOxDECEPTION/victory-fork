@@ -1355,6 +1355,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        // Read at submission, where nothing is fetched for it: what shaders
+        // left on the card there comes first (`VICTORY_OWN=wc`).
+        crate::shadow::own_read(src as usize, len);
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1860,6 +1863,10 @@ impl ValueWait {
         {
             return true;
         }
+        // A queue's thread cannot wait for a fetch: what shaders left on
+        // the card there comes at the next submission, and no more is left
+        // (`VICTORY_OWN=wc`).
+        crate::shadow::own_read(self.address as usize, bytes);
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {

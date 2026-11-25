@@ -44,7 +44,7 @@ static RESERVATIONS: Mutex<BTreeMap<usize, Reservation>> = Mutex::new(BTreeMap::
 /// at an address of its choice), with the title's own `kind`, XMem `flags`
 /// and console `protect` (before the runtime cleans them).
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
-    if !(on() || skip_wc_back()) || at == 0 || len == 0 {
+    if !(on() || skip_wc_back() || own_wc()) || at == 0 || len == 0 {
         return;
     }
     RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, Reservation { len, kind, flags, protect });
@@ -65,6 +65,106 @@ pub(crate) fn skip_wc_back() -> bool {
         }
         on
     })
+}
+
+/// `VICTORY_OWN=wc` (off by default): what shaders wrote to a card copy of
+/// title memory the title reserved write-combining is left on the card, as
+/// with [`skip_wc_back`], but the copy then owns those 64 KiB pieces
+/// (`crate::shadow`'s `Owned`): the CPU's writes to such a piece go up as
+/// the runs of bytes they changed, never as the whole piece, so the stale
+/// title bytes beside them do not land over the card's; a reader of ours
+/// that takes title memory there (the title's buffer copies, fills, texture
+/// refreshes, another copy's refresh) has the piece fetched and merged
+/// first, and the piece is not left on the card again; a piece whose page
+/// shows at more than one address, or that lies in a shader-visible
+/// descriptor heap, always comes back as before. `VICTORY_SKIP_WC_BACK=1`
+/// is left as it was, to compare the two; set one of them, not both (with
+/// both, `VICTORY_SKIP_WC_BACK` decides and nothing is owned).
+///
+/// What it still assumes: that the title's CPU does not read what shaders
+/// wrote to write-combining memory (no page is guarded for it), and that
+/// the kernel (file writes, DirectStorage) does not read it either.
+pub(crate) fn own_wc() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = OWN_FORCED.with(|f| f.get()) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_OWN").is_ok_and(|v| v.trim().eq_ignore_ascii_case("wc"));
+        if on {
+            tracing::warn!("VICTORY_OWN=wc: shader writes to write-combining title memory stay on the card; the CPU's writes there go up by changed runs (experiment)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`own_wc`]'s answer on this thread, whatever the environment.
+    static OWN_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: makes [`own_wc`] answer `on` on this thread (`None`: from the
+/// environment again).
+#[cfg(test)]
+pub(crate) fn force_own(on: Option<bool>) {
+    OWN_FORCED.with(|f| f.set(on));
+}
+
+/// The counters of [`own_wc`], since the last line ([`own_say`]).
+#[derive(Clone, Copy)]
+pub(crate) enum OwnCount {
+    /// Pieces left on the card, and their bytes.
+    Left,
+    LeftBytes,
+    /// CPU writes to owned pieces sent up by changed runs: runs and bytes.
+    Runs,
+    RunBytes,
+    /// Bytes of owned pieces refreshed without going up (a whole-piece
+    /// upload would have sent them).
+    Avoided,
+    /// Pieces fetched for a reader of ours, and their bytes; the settles
+    /// of flights that took.
+    Fetched,
+    FetchedBytes,
+    Settles,
+    /// Pieces that came back as before: aliased, read by a reader of ours,
+    /// in a shader-visible descriptor heap.
+    Aliased,
+    Read,
+    Heap,
+}
+
+#[cfg(feature = "diagnostics")]
+static OWN_COUNTS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// Adds `n` to an [`OwnCount`] (diagnostics).
+pub(crate) fn own_count(c: OwnCount, n: u64) {
+    #[cfg(feature = "diagnostics")]
+    OWN_COUNTS[c as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (c, n);
+}
+
+/// The [`OwnCount`]s of the last five seconds, said once in five seconds
+/// at most (diagnostics; called at every submission with [`own_wc`]).
+pub(crate) fn own_say() {
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        let now = EPOCH.get_or_init(Instant::now).elapsed().as_secs() / 5;
+        if SAID.swap(now, Relaxed) == now {
+            return;
+        }
+        let c: Vec<u64> = OWN_COUNTS.iter().map(|c| c.swap(0, Relaxed)).collect();
+        tracing::info!(
+            "VICTORY_OWN=wc in 5 s: {} pieces ({} MB) left on the card; {} changed runs ({} KB) sent up to owned pieces, {} MB of whole-piece upload avoided; {} pieces ({} KB) fetched for readers of ours, {} settles for them; came back as before: {} aliased, {} read by us, {} in descriptor heaps",
+            c[0], c[1] >> 20, c[2], c[3] >> 10, c[4] >> 20, c[5], c[6] >> 10, c[7], c[8], c[9], c[10]
+        );
+    }
 }
 
 /// `VICTORY_SKIP_WC_COMPARE=1`, the second half of the same EXPERIMENT

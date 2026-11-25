@@ -3048,6 +3048,9 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
+            // Read at submission, where nothing is fetched for it
+            // (`VICTORY_OWN=wc`).
+            crate::shadow::own_read(from, n * 3 * stride);
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see

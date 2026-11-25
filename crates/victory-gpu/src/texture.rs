@@ -1212,6 +1212,9 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 16 << 10;
+    // Not where a fetch can be waited for: what shaders left on the card
+    // there comes at the next submission (`VICTORY_OWN=wc`).
+    crate::shadow::own_read(at as usize, len as usize);
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
