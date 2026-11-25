@@ -21,6 +21,10 @@ mod bvhtrace;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod renderdoc;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod shot;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -28,6 +32,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod drvwatch;
+#[cfg(windows)]
+mod fpsbox;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]
