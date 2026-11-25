@@ -3390,6 +3390,17 @@ impl Shadow {
         own_count(OwnCount::RunBytes, bytes as u64);
         own_count(OwnCount::Pieces, 1);
         own_count(OwnCount::Avoided, (n - bytes) as u64);
+        if !runs.is_empty() {
+            let longest = runs.iter().map(|r| r.1).max().unwrap_or(0);
+            crate::census::own_runs_in(self.start, self.len, self.window, runs.len() as u64, bytes as u64, longest as u64);
+        }
+        // Written finely by the CPU beside what shaders wrote: the runs went
+        // up this once (they had to: the submission reads them), and the
+        // piece is fetched at the next submission and not owned again.
+        if runs.len() > crate::census::own_runs_cap() {
+            own_count(OwnCount::Mixed, 1);
+            own_mixed(from / PAGE);
+        }
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3711,6 +3722,18 @@ pub(crate) fn own_hits(reads: &[(usize, usize, u64)]) -> Vec<(Arc<Shadow>, usize
     hits
 }
 
+/// [`crate::census::own_wc`]: page `page` needed more runs than
+/// [`crate::census::own_runs_cap`] ([`Shadow::copy_runs`]). It is not left on
+/// the card again, and what the card holds newer there is fetched at the
+/// next submission ([`own_hits`]), as for a page a reader of ours took.
+fn own_mixed(page: usize) {
+    let mut o = owned();
+    o.read.insert(page);
+    if o.newer.contains_key(&page) && !o.wanted.contains(&page) {
+        o.wanted.push(page);
+    }
+}
+
 /// [`crate::census::own_wc`]: the runtime mapped, unmapped or committed
 /// title memory `[at, at + len)`. What its pages show is new, and the
 /// card's bytes from before are no longer newer: the next refresh takes
@@ -3737,7 +3760,8 @@ impl Shadow {
     /// declaration that lies in write-combining memory
     /// ([`crate::census::all_wc`]); never for a page shown at more than one
     /// address (`crate::inplace::pages_of`: another view would read title
-    /// memory the copy-back did not write), in a shader-visible descriptor
+    /// memory the copy-back did not write; but see
+    /// [`crate::census::own_aliased`]), in a shader-visible descriptor
     /// heap, or that a reader of ours took ([`own_read`], [`own_hits`]).
     /// The page is then noted as holding newer bytes on the card.
     pub(crate) fn own_skip(self: &Arc<Self>, declared: (usize, usize), lo: usize, hi: usize) -> bool {
@@ -3746,9 +3770,17 @@ impl Shadow {
         }
         use crate::census::{OwnCount, own_count};
         let page = (self.start as usize + lo) / PAGE;
-        if crate::inplace::pages_of(page * PAGE).len() >= 2 {
-            own_count(OwnCount::Aliased, 1);
-            return false;
+        let shown = crate::inplace::pages_of(page * PAGE);
+        if shown.len() >= 2 {
+            // With `VICTORY_OWN_ALIASED=1` (a measurement, see
+            // [`crate::census::own_aliased`]): owned if every address the
+            // page shows at is write-combining memory.
+            let every: Vec<(usize, usize)> = shown.iter().map(|&a| (a, a + PAGE)).collect();
+            if !(crate::census::own_aliased() && crate::census::all_wc(&every)) {
+                own_count(OwnCount::Aliased, 1);
+                return false;
+            }
+            own_count(OwnCount::AliasedOwned, 1);
         }
         if crate::descriptor::in_shader_heap(page * PAGE, PAGE) {
             own_count(OwnCount::Heap, 1);
