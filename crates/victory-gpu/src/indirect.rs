@@ -216,6 +216,165 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
+/// Jobs of one clamp table ([`bound_table`]), and the bytes each clamped
+/// record has in the scratch buffer (the longest stride a job may have).
+pub(crate) const TABLE_JOBS: u32 = 256;
+pub(crate) const TABLE_STRIDE: u32 = 64;
+
+/// The clamp of [`SOURCE`] for single records named by a table: word 0
+/// holds the number of jobs, and from byte 16 on each job is four words
+/// (kind, stride, the record's offset in the source, its offset in the
+/// scratch). The table is upload memory the CPU goes on writing after the
+/// pass is recorded: the draws recorded after it add their records, and
+/// the card reads the table when the list runs.
+const TABLE_SOURCE: &str = r#"
+#define RS "SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+ByteAddressBuffer src_args : register(t0);
+ByteAddressBuffer jobs : register(t1);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint GROUPS = 1u << 20;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= jobs.Load(0)) return;
+    uint4 job = jobs.Load4(16 + id.x * 16);
+    uint kind = job.x;
+    uint stride = job.y;
+    uint src_at = job.z;
+    uint dst_at = job.w;
+    uint cost;
+    uint2 draw_counts = uint2(0, 0);
+    uint3 groups = uint3(0, 0, 0);
+    if (kind <= 1) {
+        uint2 asked = src_args.Load2(src_at);
+        uint count = min(asked.x, 1u << 24);
+        uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        draw_counts = uint2(count, instances);
+    } else if (kind == 2) {
+        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        groups = g;
+    } else {
+        uint3 g = src_args.Load3(src_at);
+        uint was;
+        budget.InterlockedMax(4, g.x, was);
+        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128u;
+        groups = g;
+    }
+    bool over = false;
+    if (cost > 0) {
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        over = before >= BUDGET || BUDGET - before < cost;
+    }
+    if (kind <= 1) {
+        if (over) {
+            draw_counts = uint2(0, 0);
+        }
+        dst_args.Store2(dst_at, draw_counts);
+        for (uint off = 8; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        dst_args.Store3(dst_at, groups);
+        for (uint off = 12; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    }
+}
+"#;
+
+fn table_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| match host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, TABLE_SOURCE)) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "no table clamp: records are clamped one at a time");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Records, in `list`, one clamp pass over a table of up to [`TABLE_JOBS`]
+/// single records of `src` (`crate::draw`'s tables): the scratch buffer
+/// the clamped records go to (job `i` at `i * TABLE_STRIDE`, left readable
+/// as indirect arguments) and the table's CPU address for [`table_job`].
+/// The table starts empty; jobs added until the list is closed are
+/// clamped. Replaces the list's compute root signature and pipeline.
+pub(crate) fn bound_table(list: &HostList, src: &ID3D12Resource) -> Option<(ID3D12Resource, usize)> {
+    let bytes = u64::from(TABLE_JOBS * TABLE_STRIDE);
+    let (c, budget, dst) = (table_clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let table_bytes = 16 + 16 * TABLE_JOBS as usize;
+    let (table_gpu, table) = list.scratch(table_bytes as u64)?;
+    // SAFETY: the list's own upload memory, that many bytes; live buffers.
+    let (src_gpu, dst_gpu) = unsafe {
+        std::ptr::write_bytes(table, 0, table_bytes);
+        (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress())
+    };
+    if !src_gpu.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || !table_gpu.is_multiple_of(4) {
+        return None;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    let before = list.indirect_state(&dst);
+    let l = &list.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // table, scratch and budget buffers (as `record_clamp_as`).
+    unsafe {
+        l.ResourceBarrier(&[uav_barrier(), transition(&dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRootShaderResourceView(0, src_gpu);
+        l.SetComputeRootShaderResourceView(1, table_gpu);
+        l.SetComputeRootUnorderedAccessView(2, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.Dispatch(TABLE_JOBS.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ]);
+    }
+    list.indirect_readable(&dst);
+    Some((dst, table as usize))
+}
+
+/// Adds job `i` (under [`TABLE_JOBS`]) to a table of [`bound_table`]: the
+/// record of `kind` and `stride` at `src_at` of the table's source.
+pub(crate) fn table_job(table: usize, i: u32, [kind, stride, src_at]: [u32; 3]) {
+    let words = table as *mut u32;
+    // SAFETY: the table's own memory (`bound_table`), job `i` inside it;
+    // the list is not submitted while it is recorded.
+    unsafe {
+        let job = words.add(4 + 4 * i as usize);
+        job.write_volatile(kind);
+        job.add(1).write_volatile(stride);
+        job.add(2).write_volatile(src_at);
+        job.add(3).write_volatile(i * TABLE_STRIDE);
+        words.write_volatile(i + 1);
+    }
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,

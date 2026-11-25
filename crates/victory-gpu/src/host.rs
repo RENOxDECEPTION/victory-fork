@@ -839,6 +839,11 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// How often shaders of the list were given each host copy (by its
+    /// number) to write, since the list's reset: a clamp table of indirect
+    /// records stays open only while its copy's count stands
+    /// (`crate::draw`'s tables).
+    written_copies: Mutex<std::collections::HashMap<u64, u32>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -3838,6 +3843,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                written_copies: Mutex::default(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
@@ -5977,6 +5983,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.written_copies.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -6455,9 +6462,16 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        *self.written_copies.lock().unwrap_or_else(|e| e.into_inner()).entry(shadow.id()).or_insert(0) += 1;
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// How often shaders of the list were given host copy `id` to write
+    /// since its reset.
+    pub(crate) fn writes_to(&self, id: u64) -> u32 {
+        self.written_copies.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

@@ -134,6 +134,49 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// With [`tables`]: the CPU address of the window's job table (0: not
+    /// a table). `records` are then the jobs in it, record `i` clamped at
+    /// `i * crate::indirect::TABLE_STRIDE` of the scratch buffer.
+    table: usize,
+    /// With a table: how often the list's shaders had been given the copy
+    /// to write when the table was opened (`HostList::writes_to`). A table
+    /// outlives the title's dispatches and draws while that stands: none
+    /// of them can have written its records.
+    writes: u32,
+}
+
+/// Whether single indirect records are clamped through a job table
+/// (`VICTORY_INDIRECT_TABLE=1`; off by default; instead of [`windows`]).
+///
+/// A window guesses which records the next draws will read (the ones a
+/// step apart) and clamps them ahead; that left about half of the clamps
+/// standing (5,128 to 2,545 a frame on an RTX 5090). Here nothing is
+/// guessed: the first such draw records one clamp pass over a table of
+/// jobs that is still empty, and every draw after it adds its own record
+/// to the table on the CPU (any offset of the same host copy, any kind, up
+/// to `crate::indirect::TABLE_JOBS`) and draws from its slot of the
+/// scratch buffer. The card reads the table when the list runs, when it is
+/// complete. A table ends at an indirect call it cannot take, at a record
+/// of another host copy, when it is full, and when the list's shaders
+/// were given its copy to write; not at the title's other draws and
+/// dispatches (about 1,040 passes a frame for 5,100 records).
+///
+/// Measured on an RTX 5090, steady scene of the first room, with the
+/// budget in the card's memory: 237 ms a frame with a pass per record,
+/// 179 ms with tables, 177 ms with no clamp at all.
+fn tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TABLE").is_some_and(|v| v == "1"))
+}
+
+impl State {
+    /// A title draw or dispatch that is not an indirect one ends a window
+    /// of records clamped ahead; a job table stays (see `Window::writes`).
+    fn end_window(&mut self) {
+        if self.window.as_ref().is_some_and(|w| w.table == 0) {
+            self.window = None;
+        }
+    }
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -2039,7 +2082,7 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.end_window();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2349,7 +2392,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.end_window();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2740,7 +2783,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2845,7 +2888,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2978,7 +3021,7 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let windowed = (windows() || tables())
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -2989,13 +3032,68 @@ impl State {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        // With a job table (`tables`): any single record of the copy the
+        // open table reads joins it.
+        let tabled = windowed
+            && tables()
+            && stride <= crate::indirect::TABLE_STRIDE
+            && offset + u64::from(stride) <= u64::from(u32::MAX);
+        let joined = match self.window.as_mut() {
+            Some(w)
+                if tabled
+                    && w.table != 0
+                    && w.copy == args.id()
+                    && w.records < crate::indirect::TABLE_JOBS
+                    && w.writes == list.writes_to(w.copy) =>
+            {
+                let job = w.records;
+                w.records += 1;
+                crate::indirect::table_job(w.table, job, [kind, stride, offset as u32]);
+                Some((w.scratch.clone(), u64::from(job) * u64::from(crate::indirect::TABLE_STRIDE)))
+            }
+            _ => None,
+        };
+        let hit = if tables() {
+            None
+        } else {
+            self.window
+                .as_ref()
+                .filter(|w| same(w) && offset >= w.base)
+                .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+                .map(|w| (w.scratch.clone(), offset - w.base, w.step))
+        };
         let (bounded, at) = match hit {
+            _ if joined.is_some() => {
+                args.refresh(list, arguments, len);
+                let Some(joined) = joined else {
+                    return false;
+                };
+                joined
+            }
+            None if tabled => {
+                // A new table, this record its first job.
+                args.refresh(list, arguments, len);
+                let Some((bounded, table)) = crate::indirect::bound_table(list, &args.buffer) else {
+                    self.window = None;
+                    why("not bounded (no table clamp)");
+                    return false;
+                };
+                crate::indirect::table_job(table, 0, [kind, stride, offset as u32]);
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                self.window = Some(Window {
+                    copy: args.id(),
+                    kind,
+                    stride,
+                    step: crate::indirect::TABLE_STRIDE,
+                    base: 0,
+                    records: 1,
+                    scratch: bounded.clone(),
+                    table,
+                    writes: list.writes_to(args.id()),
+                });
+                (bounded, 0)
+            }
             Some((scratch, at, step)) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
@@ -3065,6 +3163,8 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    table: 0,
+                    writes: 0,
                 });
                 (bounded, 0)
             }
