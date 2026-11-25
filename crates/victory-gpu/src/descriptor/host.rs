@@ -1812,9 +1812,26 @@ impl HostHeap {
         if index >= self.count {
             return false;
         }
+        // A slot draws read through a table lately is left to its draws,
+        // as the passes over slots picked by index leave it
+        // (`texture_slots_remapped`, `slots_written_under`): the title
+        // writes its per-draw tables into the same heap every frame, and
+        // each draw makes what its table shows in a slot of its own. Those
+        // were most of the 26,000 to 43,000 records a frame this pass
+        // mirrored in run 200 and in the play session after it, each then
+        // made and brought up to date once more by the pass over buffer
+        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
+        // are mirrored too, as in run 200.
+        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
+            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let n = record.len();
-        // Never 0, which is "never looked at".
-        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        // Never 0, which is "never looked at". (A multiply-and-fold over
+        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
+        // frame this pass took over some 250,000 to 300,000 records, run
+        // 200.)
+        let print = record_print(record) | 1;
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -1831,6 +1848,74 @@ impl HostHeap {
         }
         self.mirror(index, handle, false);
         true
+    }
+
+    /// [`HostHeap::mirror_copied`] for every record of one changed page of
+    /// the title's heap (`super::sync_heaps`): title slots `slots`, the
+    /// record of slot `i` at title address `start + i * step`, and `page`
+    /// the bytes read from title address `from` on. Returns the records
+    /// looked at and those mirrored.
+    ///
+    /// The same records are mirrored as one by one. What differs is the
+    /// work for the others, which are nearly all of them (some 330,000
+    /// looked at a frame for 14,000 mirrored, 16 ms, run 225): the lock of
+    /// the fingerprints is taken once for the page and not once for each
+    /// record, and a record whose fingerprint is the one last seen is done
+    /// with before the question whether its slot was a table's lately. So
+    /// the count of slots "left to the draws" is now of records that
+    /// changed, not of every record on the page. The slots to mirror are
+    /// made after the page's walk, in slot order as before.
+    pub(crate) fn mirror_copied_page(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots {
+                let handle = start + index * step;
+                // A record that straddles the range's ends is left to the
+                // range that holds its first byte.
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page.get(at..at + step as usize) else {
+                    continue;
+                };
+                looked += 1;
+                // None past the host heap's slots, as `mirror_copied`.
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                // Never 0, which is "never looked at".
+                let print = record_print(record) | 1;
+                // The record last seen, or a slot never looked at that
+                // holds nothing: as it was.
+                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                    continue;
+                }
+                // A table's slot lately: left to its draws, and looked at
+                // again next time.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                *last = print;
+                due.push((index as u32, handle));
+            }
+        }
+        for &(index, handle) in &due {
+            self.mirror(index, handle, false);
+        }
+        (looked, due.len() as u64)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2139,6 +2224,37 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
+
+/// Whether the pass over records copied in as bytes also mirrors slots
+/// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
+/// off by default: [`HostHeap::mirror_copied`]).
+fn sync_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: slots on changed heap pages that
+/// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
+pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
+/// equal records give equal prints, and two different records the same
+/// print about once in 2^64. Not a hash anyone can attack: the records
+/// are our own.
+fn record_print(record: &[u8]) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = K ^ record.len() as u64;
+    let mut words = record.chunks_exact(8);
+    for word in &mut words {
+        let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+        h = (h ^ w).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    for &b in words.remainder() {
+        h = (h ^ u64::from(b)).wrapping_mul(K);
+    }
+    h ^ (h >> 32)
+}
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
 /// bytes (`VICTORY_VIEW_OWN_COPY=0`: it is refused and reads zeros, as
@@ -3507,6 +3623,31 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+}
+
+#[cfg(test)]
+mod record_print_tests {
+    use super::record_print;
+
+    /// Equal records print alike; a record that differs in any one byte,
+    /// or in its length, prints otherwise.
+    #[test]
+    fn a_record_that_changed_prints_otherwise() {
+        let record: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(5)).collect();
+        let print = record_print(&record);
+        assert_eq!(print, record_print(&record.clone()));
+        for at in 0..32 {
+            for bit in 0..8 {
+                let mut other = record.clone();
+                other[at] ^= 1 << bit;
+                assert_ne!(record_print(&other), print, "byte {at} bit {bit}");
+            }
+        }
+        assert_ne!(record_print(&record[..16]), print);
+        assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
+        // A record of zeros is told from "never looked at" by the caller's `| 1`.
+        assert_ne!(record_print(&[0u8; 32]) | 1, 0);
     }
 }
 
