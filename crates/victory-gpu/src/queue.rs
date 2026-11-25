@@ -1088,6 +1088,11 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             "presents sent behind their queue's line so far (VICTORY_ASYNC_PRESENT=1); the others ran the old way"
         );
     }
+    // The title's frame this flips, for its statistics.
+    // SAFETY: the title passes `planes` plane descriptions.
+    if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } {
+        crate::frame::flipped(plane.token);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
