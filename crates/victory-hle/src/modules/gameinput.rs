@@ -1166,7 +1166,13 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            // The first look after focus comes back takes keys down now only: the low bit
+            // holds presses made in other windows since the last look.
+            static WAS_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !focused() {
+                WAS_FOCUSED.store(false, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let fresh = !WAS_FOCUSED.swap(true, std::sync::atomic::Ordering::Relaxed);
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1176,7 +1182,7 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| {
                         let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
-                        state < 0 || state & 1 != 0
+                        state < 0 || (!fresh && state & 1 != 0)
                     })
                     .collect();
                 down.extend(held);
