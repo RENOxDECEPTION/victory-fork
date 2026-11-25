@@ -430,6 +430,31 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     out
 }
 
+/// The compare's passes over `ranges` (copy, span, its first dword in the
+/// results), the compared ranges of a submission in order: a range of the
+/// same copy whose pieces and dwords both go on where the one before ended
+/// joins that one's pass. Each pass: the index of its first range, the
+/// span grown to the pass, its first dword. Every piece keeps its dword;
+/// ranges that share a piece (each has a dword for it) stay apart.
+pub(crate) fn compare_runs(ranges: &[(usize, CardSpan, u32)]) -> Vec<(usize, CardSpan, u32)> {
+    let mut out: Vec<(usize, CardSpan, u32)> = Vec::with_capacity(ranges.len());
+    for (i, &(copy, span, at)) in ranges.iter().enumerate() {
+        match out.last_mut() {
+            Some((first, run, run_at))
+                if ranges[*first].0 == copy
+                    && span.skew == run.skew
+                    && span.first == run.first + run.pieces
+                    && at == *run_at + run.pieces =>
+            {
+                run.pieces += span.pieces;
+                run.to = span.to;
+            }
+            _ => out.push((i, span, at)),
+        }
+    }
+    out
+}
+
 /// A declared range of a copy in the card's memory, as the compare on the
 /// card takes it: its offsets in the copy, its first 64 KiB piece (pieces
 /// are cut at multiples of 64 KiB of title memory; piece 0 holds offset
@@ -466,7 +491,34 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, compare_runs, joined, joined_piece_runs};
+
+    /// Compare passes join ranges of one copy only where both pieces and
+    /// dwords go on, so every piece is compared into the dword it had.
+    #[test]
+    fn compare_passes_keep_every_piece_at_its_dword() {
+        let span = |first: u32, pieces: u32| CardSpan {
+            from: first * 65536,
+            to: (first + pieces) * 65536,
+            first,
+            pieces,
+            skew: 0,
+        };
+        let (a, b) = (0x1000usize, 0x2000usize);
+        // a: pieces 2..4, then 4 (joins), then 5 a dword late (apart);
+        // b: 6 (another copy); a: 7 after b (apart), then 8 (joins).
+        let ranges = [(a, span(2, 2), 0), (a, span(4, 1), 2), (a, span(5, 1), 4), (b, span(6, 1), 5), (a, span(7, 1), 6), (a, span(8, 1), 7)];
+        let got: Vec<_> = compare_runs(&ranges).into_iter().map(|(i, s, at)| (i, s.first, s.pieces, at, s.to)).collect();
+        assert_eq!(got, [(0, 2, 3, 0, 5 * 65536), (2, 5, 1, 4, 6 * 65536), (3, 6, 1, 5, 7 * 65536), (4, 7, 2, 6, 9 * 65536)]);
+        // Every (copy, piece, dword) of the ranges, and no other, is in a pass.
+        let mut wanted: Vec<(usize, u32, u32)> = ranges.iter().flat_map(|&(c, s, at)| (0..s.pieces).map(move |p| (c, s.first + p, at + p))).collect();
+        let mut passes: Vec<(usize, u32, u32)> =
+            compare_runs(&ranges).into_iter().flat_map(|(i, s, at)| (0..s.pieces).map(move |p| (ranges[i].0, s.first + p, at + p))).collect();
+        wanted.sort_unstable();
+        passes.sort_unstable();
+        assert_eq!(passes, wanted);
+        assert!(compare_runs(&[]).is_empty());
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -685,21 +737,20 @@ pub(crate) fn relay_fetched(number: u64) {
 /// of the first flight's copy-back removed it while the second was still
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
+///
+/// By hash: every dispatch's declaring and every range's end walked the
+/// list (thousands of declarings a submission).
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(std::collections::HashMap<(usize, usize), (u32, u64)>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
     fn declare(&mut self, range: (usize, usize), number: u64) {
-        match self.0.iter_mut().find(|f| f.0 == range) {
-            Some(f) => {
-                if f.2 != number {
-                    f.1 += 1;
-                    f.2 = number;
-                }
-            }
-            None => self.0.push((range, 1, number)),
+        let f = self.0.entry(range).or_insert((0, 0));
+        if f.0 == 0 || f.1 != number {
+            f.0 += 1;
+            f.1 = number;
         }
     }
 
@@ -708,11 +759,11 @@ impl Flights {
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut free = Vec::new();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
-                Some(at) => {
-                    self.0[at].1 = self.0[at].1.saturating_sub(1);
-                    if self.0[at].1 == 0 {
-                        self.0.swap_remove(at);
+            match self.0.get_mut(range) {
+                Some(f) => {
+                    f.0 = f.0.saturating_sub(1);
+                    if f.0 == 0 {
+                        self.0.remove(range);
                         free.push(*range);
                     }
                 }
@@ -2748,12 +2799,14 @@ impl Shadow {
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if relay() {
-            let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| !free.contains(r));
+        // By hash: a walk of `ranges` per pending range was quadratic (the
+        // world declares hundreds of ranges a submission).
+        let done: std::collections::HashSet<(usize, usize)> = if relay() {
+            self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges).into_iter().collect()
         } else {
-            pending.retain(|r| !ranges.contains(r));
-        }
+            ranges.iter().copied().collect()
+        };
+        pending.retain(|r| !done.contains(r));
         if !pending.is_empty() || self.card.is_some() {
             return;
         }

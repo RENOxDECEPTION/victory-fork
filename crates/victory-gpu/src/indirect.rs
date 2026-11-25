@@ -991,7 +991,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1019,6 +1019,27 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every thread of a piece's group counts: a piece's first and last
+        // byte, and two 16-byte words swapped (of two threads, and of one
+        // thread 64 words apart), are each flagged; put back, nothing is.
+        let poke = |offset: usize, bytes: &[u8]| {
+            // SAFETY: inside the mapping.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), now_ptr.add(offset), bytes.len()) };
+        };
+        for offset in [PIECE, 2 * PIECE - 1] {
+            poke(offset, &[content[offset] ^ 1]);
+            assert_eq!(run(&mut warp, 1), [0, 1, 0], "byte {offset:#x}");
+            poke(offset, &content[offset..offset + 1]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
+        for (x, y) in [(2 * PIECE, 2 * PIECE + 16), (2 * PIECE + 16, 2 * PIECE + 16 + 64 * 16)] {
+            poke(x, &content[y..y + 16]);
+            poke(y, &content[x..x + 16]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 1], "words {x:#x} and {y:#x}");
+            poke(x, &content[x..x + 16]);
+            poke(y, &content[y..y + 16]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software

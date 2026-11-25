@@ -873,11 +873,13 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
-                continue;
-            }
+        // Only the slots the layout reads: most use one or two of 32.
+        let mut bits = p.slots;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
             count = slot + 1;
+            let (view, v) = (&mut views[slot], self.vertex[slot]);
             if v.address == 0 || v.size == 0 {
                 continue;
             }
