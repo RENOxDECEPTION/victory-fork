@@ -465,7 +465,7 @@ fn need(block: usize) {
 /// `v_readfirstlane`).
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+pub(super) fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
@@ -945,7 +945,12 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+fn lds_meetings(
+    p: &crate::ir::Program,
+    st: &Structured,
+    all: &[bool],
+    threads: [u32; 3],
+) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -994,10 +999,14 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // A region that reads and writes LDS is still taken when it only raises flags
     // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
     // the region leaves behind.
+    // So is one that one lane at most enters, or whose writes are atomics only
+    // (`lds_region::order_free`).
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
-        if !(flags_on && lds_flag_region(p, st, &blocks)) {
+        if !(flags_on
+            && (lds_flag_region(p, st, &blocks) || super::lds_region::order_free(p, st, all, &blocks, threads)))
+        {
             return None;
         }
     }
@@ -1687,7 +1696,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, cs.threads) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1741,7 +1750,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, &all, cs.threads).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}

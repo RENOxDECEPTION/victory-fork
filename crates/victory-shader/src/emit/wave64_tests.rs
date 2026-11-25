@@ -842,3 +842,114 @@ fn a_scan_over_console_waves_sums_each_waves_predecessors() {
     assert!(wrong.is_empty(), "threads (index, got, want): {wrong:?}");
     eprintln!("ran on the hardware device: every thread has its waves' predecessors' sum");
 }
+
+/// One console wave of 64 threads with 512 bytes of LDS and two lane-branch regions that both
+/// read and write it ([`super::lds_region`]):
+/// - thread 0 alone (`v0 == 0`) writes 16 to LDS 0, reads it back, and writes 21 to LDS 4
+///   and 0 to the counter at LDS 8;
+/// - the threads below s0 read LDS 4 and take a slot of the counter (`ds_add_rtn_u32`).
+///
+/// Every thread then stores what it read (dword t), its slot (64 + t) and the counter after
+/// both regions (128 + t). `read_at`: the byte the second region reads (4; 8 is the counter).
+fn lds_regions_program(read_at: u32) -> NativeProgram {
+    let at = |w: [u32; 2], offset: u32| [w[0] | offset, w[1]];
+    let mut words = vec![
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0A_02C1, // v_mov_b32 v5, -1
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz past the 10 dwords of the branch
+        0x7E04_0290, // v_mov_b32 v2, 16
+    ];
+    words.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 2)); // ds_write_b32 v9, v2
+    words.extend_from_slice(&ds(DS_READ_B32, 3, 9, 0)); // ds_read_b32 v3, v9
+    words.push(0x4A06_0685); // v_add_nc_u32 v3, 5, v3
+    words.extend_from_slice(&at(ds(DS_WRITE_B32, 0, 9, 3), 4)); // ds_write_b32 v9, v3 offset:4
+    words.extend_from_slice(&at(ds(DS_WRITE_B32, 0, 9, 9), 8)); // ds_write_b32 v9, v9 offset:8
+    words.extend_from_slice(&[
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz past the 5 dwords of the branch
+    ]);
+    words.extend_from_slice(&at(ds(DS_READ_B32, 4, 9, 0), read_at)); // ds_read_b32 v4, v9 offset:4
+    words.push(0x7E0E_0281); // v_mov_b32 v7, 1
+    words.extend_from_slice(&at(ds(DS_ADD_RTN_U32, 5, 9, 7), 8)); // ds_add_rtn_u32 v5, v9, v7 offset:8
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    words.extend_from_slice(&at(ds(DS_READ_B32, 6, 9, 0), 8)); // ds_read_b32 v6, v9 offset:8
+    words.extend_from_slice(&[
+        0x341C_0082, // v_lshlrev_b32 v14, 2, v0
+        0xE070_1000,
+        0x8002_040E, // buffer_store_dword v4, v14, s[8:11], 0 offen
+        0xE070_1100,
+        0x8002_050E, // buffer_store_dword v5, v14, s[8:11], 0 offen offset:256
+        0xE070_1200,
+        0x8002_060E, // buffer_store_dword v6, v14, s[8:11], 0 offen offset:512
+    ]);
+    let mut native = native(&words);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+const DS_ADD_RTN_U32: u8 = 0x20;
+
+#[test]
+fn lds_regions_of_one_lane_or_atomics_run_in_waves_of_32() {
+    let native = lds_regions_program(4);
+    assert_eq!(flag_wave(&native), Some(32));
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => panic!("the hardware device refuses the program: {e}"),
+    };
+    let below = 50u32;
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = below;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(192)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let out = &out[0];
+    let read: Vec<u32> = (0..64).map(|t| if t < below { 21 } else { 0 }).collect();
+    assert_eq!(&out[..64], &read[..], "what each thread read of LDS 4");
+    let mut slots: Vec<u32> = out[64..64 + below as usize].to_vec();
+    slots.sort_unstable();
+    assert_eq!(slots, (0..below).collect::<Vec<_>>(), "the slots the threads below s0 took");
+    assert!(out[64 + below as usize..128].iter().all(|&s| s == u32::MAX), "the others took none");
+    assert!(out[128..192].iter().all(|&n| n == below), "the counter after both regions: {:?}", &out[128..192]);
+    eprintln!("ran on the hardware device: every thread read 21 and took one slot of {below}");
+}
+
+#[test]
+fn an_lds_region_reading_what_its_atomics_change_keeps_64_lanes() {
+    // the threads below s0 read the counter they add to: what each reads depends on which
+    // host wave added first
+    assert_eq!(flag_wave(&lds_regions_program(8)), Some(64));
+}
