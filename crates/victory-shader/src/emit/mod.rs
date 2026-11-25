@@ -306,7 +306,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_once(c, native, p, st, io, res);
+    let original = emit_halves(c, native, p, st, io, res);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -320,7 +320,32 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_once(c, native, &p, &st, &io, &res)
+    emit_halves(c, native, &p, &st, &io, &res)
+}
+
+/// [`emit_once`], retried with unpaired first interpolation halves
+/// evaluated on their own when that is what failed.
+fn emit_halves(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res);
+    // A first half of an interpolation read where no second half is (the
+    // deferred material programs export one on a path that skips it): once
+    // more, those halves evaluating on their own. Only then, so a program
+    // that translated keeps its translation (the fallback makes the
+    // attribute's row a per-vertex one).
+    match first {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            let io = io::raise_with(p, native, true)?;
+            emit_once(c, native, p, st, &io, res).or(first)
+        }
+        other => other,
+    }
 }
 
 /// One emission attempt: `emit_program` plus the wave64-on-wave32 and
