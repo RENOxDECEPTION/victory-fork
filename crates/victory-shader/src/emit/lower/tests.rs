@@ -130,6 +130,11 @@ fn packed_elements_behind_another_take_the_first_free_dword() {
 
 /// Whether a synthetic compute program translates with these input registers.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    lower_cs(words, rsrc2).map(|_| ())
+}
+
+/// A synthetic compute program with these input registers, lowered.
+fn lower_cs(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -158,7 +163,23 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
     })
-    .map(|_| ())
+}
+
+/// A compute program's group id in x is counted from the group the host
+/// starts its dispatch at (`USER_GROUP_BASE`, a user-data dword the host
+/// computes): the host runs a dispatch of more than 65,535 groups in x
+/// as several. Its group id in y is not.
+#[test]
+fn group_id_in_x_is_counted_from_the_hosts_base() {
+    use super::super::shader::USER_GROUP_BASE;
+    let base = RootType::Other(USER_GROUP_BASE);
+    // s_cmp_eq_u32 s<reg>, 0; a branch over a move; the end.
+    let program = |reg: u32| [0xBF06_8000 | reg, 0xBF85_0001, 0xBE86_0380, S_ENDPGM];
+    let group_ids_xy = 3 << 7;
+    let x = lower_cs(&program(0), group_ids_xy).expect("reads the group id in x");
+    assert_eq!(x.user_data.iter().filter(|u| u.root == base).count(), 1);
+    let y = lower_cs(&program(1), 2 << 7).expect("reads the group id in y");
+    assert!(y.user_data.iter().all(|u| u.root != base));
 }
 
 /// Lowers a compute program with the root parameters `layout` (in user
@@ -518,6 +539,51 @@ fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own()
         assert_eq!(l.nonuniform_handles, 1);
         assert!(!l.wave_ops);
     }
+}
+
+#[test]
+fn a_loop_each_lane_leaves_on_its_own_is_no_code_every_lane_runs() {
+    // The waterfall loop in one block, its branch back on the lanes still
+    // waiting: every lane runs its first pass, only those still waiting
+    // the next ones, so two host waves cannot meet there.
+    use crate::resource::tests::cmpx_waterfall;
+    for wave64 in [false, true] {
+        let words = cmpx_waterfall(wave64, true);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        use crate::structure::LaneExit;
+        let back =
+            |b: usize| matches!(st.exits[b], LaneExit::Branch { taken, .. } if taken == b);
+        let looped = (0..p.blocks.len())
+            .find(|&b| back(b))
+            .expect("a block that branches back to itself");
+        assert!(!all[looped], "wave64 {wave64}");
+        // The code before the loop and after it still is.
+        assert!(all[0], "wave64 {wave64}");
+        assert!(all[p.blocks.len() - 1], "wave64 {wave64}");
+    }
+    // A loop that goes round on a scalar count, with a lane branch inside it that does
+    // not leave it: only the branch's own arm is code not every lane runs.
+    let words = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0 (byte 4: the loop)
+        0xBE87_3C6A, // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0001, // s_cbranch_execz (past the arm)
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (byte 16: the arm)
+        0x887E_077E, // s_or_b32 exec_lo, exec_lo, s7 (byte 20)
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF07_8406, // s_cmp_lg_u32 s6, 4
+        0xBF85_FFF8, // s_cbranch_scc1 (back to byte 4)
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, false, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let all = super::all_lane_blocks(&st).unwrap();
+    let at = |offset| (0..p.blocks.len()).find(|&b| p.blocks[b].offset == offset).unwrap();
+    assert!(all[at(4)] && all[at(20)] && !all[at(16)]);
 }
 
 #[test]
