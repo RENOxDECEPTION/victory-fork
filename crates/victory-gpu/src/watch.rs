@@ -757,6 +757,7 @@ impl CleanBlocks {
         }
     }
 
+    /// Whether `block` lies in a clean run.
     fn contains(&self, block: &usize) -> bool {
         self.0.range(..=*block).next_back().is_some_and(|(_, &end)| *block < end)
     }
@@ -821,6 +822,48 @@ fn view_known() -> bool {
     }
 }
 
+/// The guards' kernel calls since the last log line (diagnostics), by
+/// [`KC`]: said every five seconds from [`guard`].
+#[cfg(feature = "diagnostics")]
+static KERNEL_CALLS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// The indices of [`KERNEL_CALLS`].
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum KC {
+    Guards,
+    IsView,
+    RunSet,
+    RunFailed,
+    BlockSet,
+    BlockFailed,
+    Uncommitted,
+    Opened,
+}
+
+fn kc(c: KC) {
+    #[cfg(feature = "diagnostics")]
+    KERNEL_CALLS[c as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = c;
+}
+
+#[cfg(feature = "diagnostics")]
+fn kc_say() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let now = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 5;
+    if SAID.swap(now, Relaxed) == now {
+        return;
+    }
+    let c: Vec<u64> = KERNEL_CALLS.iter().map(|c| c.swap(0, Relaxed)).collect();
+    tracing::info!(
+        "guard kernel calls in 5 s: {} guard passes, {} is-view queries, {} run protects ({} failed), {} block protects ({} failed), {} uncommitted queries, {} blocks opened",
+        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
+    );
+}
+
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: CleanBlocks(BTreeMap::new()),
@@ -856,12 +899,21 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
+    kc(KC::Guards);
+    #[cfg(feature = "diagnostics")]
+    kc_say();
+    if !known {
+        kc(KC::IsView);
+    }
     if !known && !is_view(start, end) {
         return None;
     }
     install();
     let mut g = guards();
     let mut written = Vec::new();
+    let lazy = alias_lazy();
+    // Blocks noted clean without a protect call (`VICTORY_ALIAS_LAZY`).
+    let mut regroup = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
@@ -869,7 +921,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let mut run = None;
         for block in from..to {
             let mut open = true;
-            if g.absent.contains(&block) {
+            if g.absent.contains(&block) && absent_told() {
+                // Still absent: the runtime would have said otherwise
+                // (`title_memory_committed`, `title_memory_remapped`).
+                open = false;
+            } else if g.absent.contains(&block) {
                 // Ordinary commits need no runtime mapping notification. Reuse
                 // this asking's query for the following blocks in the same region.
                 if block >= uncommitted_until {
@@ -885,6 +941,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 if g.protected.contains(&block) {
                     // Written through the runtime, still read-only.
                     g.clean.insert(block, block + 1);
+                    if lazy {
+                        regroup.push(block);
+                    }
                 } else {
                     run.get_or_insert(block);
                     continue;
@@ -897,6 +956,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if let Some(begin) = run {
             protect(&mut g, begin, to);
         }
+    }
+    if !regroup.is_empty() {
+        reprotect_groups(&mut g, &regroup);
     }
     Some(written)
 }
@@ -956,6 +1018,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    let lazy = alias_lazy();
+    let mut pending = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -973,10 +1037,93 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block {
-                    protect_alias(g, alias);
+                    if lazy {
+                        pending.push(alias);
+                    } else {
+                        protect_alias(g, alias);
+                    }
                 }
             }
         }
+    }
+    protect_aliases(g, pending);
+}
+
+/// Whether opening a block leaves its other views read-only, only noted
+/// not clean (`VICTORY_ALIAS_LAZY=1`; off by default).
+///
+/// Invariant: for every aliased group, either all its members are
+/// read-only or none is noted clean. `open` keeps the group and only
+/// removes the clean notes of the read-only members (no syscall); `guard`,
+/// whenever it notes a block clean without guarding it afresh, makes the
+/// group's writable members read-only again ([`reprotect_groups`], runs of
+/// adjacent blocks in one call); `protect` already does so for the rest.
+fn alias_lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_LAZY").is_some_and(|v| v == "1"))
+}
+
+/// Makes the writable other views of the pages of `blocks` read-only
+/// again, as `protect` does (`VICTORY_ALIAS_LAZY`).
+fn reprotect_groups(g: &mut Guards, blocks: &[usize]) {
+    if !view_guard() {
+        // No group can be guarded: the blocks stay not clean.
+        for &block in blocks {
+            g.clean.remove(block);
+        }
+        return;
+    }
+    let mut members = Vec::new();
+    for &block in blocks {
+        let shown = crate::inplace::pages_of(block * BLOCK);
+        if shown.len() < 2 {
+            continue;
+        }
+        if shown.len() > MANY_VIEWS {
+            // Too many views to make read-only as a group: the block stays
+            // not clean, so its next guard reports it written.
+            g.clean.remove(block);
+            continue;
+        }
+        g.aliased.insert(block);
+        for alias in shown {
+            let alias = alias / BLOCK;
+            g.aliased.insert(alias);
+            if alias != block {
+                members.push(alias);
+            }
+        }
+    }
+    protect_aliases(g, members);
+}
+
+/// [`protect_alias`] for many blocks: the ones not read-only yet, adjacent
+/// ones in one call (block by block if that call fails).
+fn protect_aliases(g: &mut Guards, mut blocks: Vec<usize>) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks.retain(|b| !g.protected.contains(b));
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+            j += 1;
+        }
+        let (from, to) = (blocks[i], blocks[j - 1] + 1);
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        if j - i > 1 && unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) } != 0 {
+            g.protected.extend(from..to);
+            if view_known() {
+                g.viewed.extend(from..to);
+            }
+        } else {
+            for &block in &blocks[i..j] {
+                protect_alias(g, block);
+            }
+        }
+        i = j;
     }
 }
 
@@ -1041,14 +1188,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.viewed.extend(from..to);
         }
     };
+    kc(KC::RunSet);
     if set(from, to) {
         note(g, from, to);
         return;
     }
+    kc(KC::RunFailed);
     for block in from..to {
+        kc(KC::BlockSet);
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else {
+            kc(KC::BlockFailed);
             #[cfg(feature = "diagnostics")]
             let error = std::io::Error::last_os_error();
             if block < uncommitted_end(block) {
@@ -1069,8 +1220,45 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// A write at `at` faulted in a copy of ours into title memory
+/// (`crate::plaincopy::copy_title`): whether it can go on, the block's
+/// guard opened or the memory writable after all.
+pub(crate) fn fault_write(at: usize) -> bool {
+    let mut g = guards();
+    open(&mut g, at, at + 1) || writable(at)
+}
+
+/// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`
+/// with `MEM_COMMIT`): its blocks are no longer absent.
+pub fn title_memory_committed(at: usize, len: usize) {
+    let mut g = guards();
+    if g.absent.is_empty() {
+        return;
+    }
+    let blocks: Vec<usize> = g.absent.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in blocks {
+        g.absent.remove(&block);
+    }
+}
+
+/// Whether a block noted absent is taken as absent until the runtime says
+/// it committed or mapped it (`VICTORY_ABSENT_TOLD=1`; off by default).
+///
+/// A range with absent blocks asked the system at every refresh whether
+/// they were still uncommitted (`uncommitted_end`, a walk of the page
+/// tables): 10 ms a frame of our submit thread in `NtQueryVirtualMemory`
+/// under `guard` (RTX 5090, steady scene of the first room, 135 ms a
+/// frame). The title commits memory through `XMemVirtualAlloc` alone and
+/// maps pages through the runtime, and both tell us
+/// ([`title_memory_committed`], [`title_memory_remapped`]).
+fn absent_told() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_TOLD").is_some_and(|v| v == "1"))
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    kc(KC::Uncommitted);
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1096,6 +1284,26 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         return any;
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    if alias_lazy() {
+        // The other views stay read-only and lose their clean note: the
+        // next `guard` reports such a block as written, with no syscall,
+        // and a write through one of them faults once and opens it. The
+        // group is kept (`aliased` is not touched): `guard` makes its
+        // writable members read-only again when it notes any of them clean.
+        let range = start / BLOCK..end.div_ceil(BLOCK);
+        for block in aliased {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                // Blocks of the range itself were opened above.
+                if !range.contains(&alias) && g.clean.contains(&alias) {
+                    g.clean.remove(alias);
+                    #[cfg(feature = "diagnostics")]
+                    ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        return any;
+    }
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
@@ -1122,6 +1330,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
+        kc(KC::Opened);
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     !blocks.is_empty()
@@ -1305,6 +1514,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
+    // Nor are the card's bytes newer there (`VICTORY_OWN=wc`).
+    crate::shadow::own_forget(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();

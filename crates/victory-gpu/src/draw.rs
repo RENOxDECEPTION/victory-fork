@@ -134,6 +134,58 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// With [`tables`]: the CPU address of the window's job table (0: not
+    /// a table). `records` are then the jobs in it, record `i` clamped at
+    /// `i * crate::indirect::TABLE_STRIDE` of the scratch buffer.
+    table: usize,
+    /// With a table: how often the list's shaders had been given the copy
+    /// to write when the table was opened (`HostList::writes_to`). A table
+    /// outlives the title's dispatches and draws while that stands: none
+    /// of them can have written its records.
+    writes: u32,
+}
+
+/// Whether single indirect records are clamped through a job table
+/// (`VICTORY_INDIRECT_TABLE=1`; off by default; instead of [`windows`]).
+///
+/// A window guesses which records the next draws will read (the ones a
+/// step apart) and clamps them ahead; that left about half of the clamps
+/// standing (5,128 to 2,545 a frame on an RTX 5090). Here nothing is
+/// guessed: the first such draw records one clamp pass over a table of
+/// jobs that is still empty, and every draw after it adds its own record
+/// to the table on the CPU (any offset of the same host copy, any kind, up
+/// to `crate::indirect::TABLE_JOBS`) and draws from its slot of the
+/// scratch buffer. The card reads the table when the list runs, when it is
+/// complete. A table ends at an indirect call it cannot take, at a record
+/// of another host copy, when it is full, and when the list's shaders
+/// were given its copy to write; not at the title's other draws and
+/// dispatches (about 1,040 passes a frame for 5,100 records).
+///
+/// Measured on an RTX 5090, steady scene of the first room, with the
+/// budget in the card's memory: 237 ms a frame with a pass per record,
+/// 179 ms with tables, 177 ms with no clamp at all.
+fn tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TABLE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dropped stage of the ray-tracing structure builder is dropped
+/// before the window and the list's gathering are ended
+/// (`VICTORY_RT_DROP_EARLY=1`; off by default). Such a dispatch writes
+/// nothing, so the windows and the gathering it would have ended stay.
+fn rt_drop_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RT_DROP_EARLY").as_deref() == Ok("1"))
+}
+
+impl State {
+    /// A title draw or dispatch that is not an indirect one ends a window
+    /// of records clamped ahead; a job table stays (see `Window::writes`).
+    fn end_window(&mut self) {
+        if self.window.as_ref().is_some_and(|w| w.table == 0) {
+            self.window = None;
+        }
+    }
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -1067,11 +1119,13 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
-                continue;
-            }
+        // Only the slots the layout reads: most use one or two of 32.
+        let mut bits = p.slots;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
             count = slot + 1;
+            let (view, v) = (&mut views[slot], self.vertex[slot]);
             if v.address == 0 || v.size == 0 {
                 continue;
             }
@@ -2380,8 +2434,20 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // A dropped stage of the structure builder writes nothing, so with
+        // VICTORY_RT_DROP_EARLY it ends neither the window nor the gathering.
+        let dropped = rt_drop_early() && crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs();
+        if dropped {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                self.list_dropped_roots([x, y, z]);
+            }
+            return;
+        }
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.end_window();
         list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2810,7 +2876,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.end_window();
         if self.may_store() {
             list.gather_close();
         }
@@ -3257,7 +3323,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window();
         if self.may_store() {
             list.gather_close();
         }
@@ -3330,6 +3396,9 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
+            // Read at submission, where nothing is fetched for it
+            // (`VICTORY_OWN=wc`).
+            crate::shadow::own_read(from, n * 3 * stride);
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -3365,7 +3434,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window();
         if self.may_store() {
             list.gather_close();
         }
@@ -3509,7 +3578,7 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let windowed = (windows() || tables())
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3704,6 +3773,8 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    table: 0,
+                    writes: 0,
                 });
                 (bounded, 0)
             }

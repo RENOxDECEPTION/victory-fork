@@ -633,21 +633,32 @@ impl Tiled {
     }
 }
 
-impl Drop for Tiled {
-    fn drop(&mut self) {
-        let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
+impl Tiled {
+    /// Gives its tiles back to the heaps and off the counts, once (what is
+    /// given is emptied; also called ahead of the drop when the release is
+    /// left to the reaper thread, `VICTORY_SWEEP_IDLE`).
+    pub(crate) fn release_tiles(&self) {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let runs = std::mem::take(&mut given.runs);
+        drop(given);
         let mut bytes = 0;
         let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
+        for &(index, start, tiles) in &runs {
             by_heap.entry(index).or_default().push((start, tiles));
             bytes += u64::from(tiles) * TILE;
         }
         for (index, runs) in by_heap {
             give_back(index, &runs);
         }
+        STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Tiled {
+    fn drop(&mut self) {
+        self.release_tiles();
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
-        STATS[2].fetch_sub(bytes, Ordering::Relaxed);
     }
 }
 

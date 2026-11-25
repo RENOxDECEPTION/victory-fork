@@ -656,6 +656,7 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
@@ -678,6 +679,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -693,6 +695,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

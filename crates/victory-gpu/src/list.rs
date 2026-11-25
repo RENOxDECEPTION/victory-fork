@@ -693,13 +693,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            let (texture, before, wanted) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(wanted),
             })
         }
         1 => Some(Barrier {
@@ -826,8 +826,7 @@ pub fn upscale_stretch(
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    if let Some((texture, before, state)) = list.transition(resource, state) {
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -1343,7 +1342,7 @@ extern "system" fn clear_rtv(
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
+            if let Some((_, before, _)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
                 list.list.ResourceBarrier(&[crate::host::transition(
                     texture,
@@ -1416,6 +1415,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         let len = len as usize;
         #[cfg(feature = "diagnostics")]
         crate::bvhtrace::line(|| format!("X recorded {dst:#x}+{len:#x} from {src:#x}"));
+        // Read at submission, where nothing is fetched for it: what shaders
+        // left on the card there comes first (`VICTORY_OWN=wc`).
+        crate::shadow::own_read(src as usize, len);
         list.defer(move || {
             #[cfg(feature = "diagnostics")]
             crate::bvhtrace::line(|| {
@@ -2178,6 +2180,10 @@ impl ValueWait {
         {
             return true;
         }
+        // A queue's thread cannot wait for a fetch: what shaders left on
+        // the card there comes at the next submission, and no more is left
+        // (`VICTORY_OWN=wc`).
+        crate::shadow::own_read(self.address as usize, bytes);
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
