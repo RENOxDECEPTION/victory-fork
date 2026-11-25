@@ -112,6 +112,35 @@ pub(crate) fn force_own(on: Option<bool>) {
     OWN_FORCED.with(|f| f.set(on));
 }
 
+/// With [`own_wc`]: how many changed runs one refresh of an owned piece
+/// may send up (`VICTORY_OWN_RUNS`, 8 by default, at least 1). A piece
+/// that needs more is written by the CPU and the card both, finely (each
+/// run is a card copy of its own, and gap bytes between runs may hold the
+/// card's bytes, so runs are never joined): its runs go up this once, and
+/// then it is fetched at the next submission and comes back as before
+/// from then on.
+pub(crate) fn own_runs_cap() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_OWN_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(8, |n| n.max(1)))
+}
+
+/// With [`own_wc`], `VICTORY_OWN_ALIASED=1` (off by default; to measure
+/// what leaving aliased pieces out costs): a piece whose page is shown at
+/// more than one address is owned too, if every address it is shown at
+/// lies in a write-combining reservation.
+///
+/// What can go wrong with it: the copy-back was what made the other
+/// addresses see what shaders wrote. Title memory at every address of the
+/// page stays stale; another copy of ours over another address (a refresh,
+/// a texture, a buffer copy there) takes the stale bytes and the fetch for
+/// readers does not see it (pages are matched by the owning address
+/// only); and if shaders write the page through copies at two addresses,
+/// the two card copies drift apart with nothing bringing them together.
+pub(crate) fn own_aliased() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OWN_ALIASED").is_some_and(|v| v == "1"))
+}
+
 /// The counters of [`own_wc`], since the last line ([`own_say`]).
 #[derive(Clone, Copy)]
 pub(crate) enum OwnCount {
@@ -125,6 +154,11 @@ pub(crate) enum OwnCount {
     /// the bytes of them that did not go up.
     Pieces,
     Avoided,
+    /// Owned pieces that needed more than [`own_runs_cap`] runs: no longer
+    /// owned.
+    Mixed,
+    /// Aliased pieces owned all the same ([`own_aliased`]).
+    AliasedOwned,
     /// Pieces fetched for a reader of ours, and their bytes; the settles
     /// of flights that took.
     Fetched,
@@ -138,7 +172,32 @@ pub(crate) enum OwnCount {
 }
 
 #[cfg(feature = "diagnostics")]
-static OWN_COUNTS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+static OWN_COUNTS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// With [`own_wc`] (diagnostics): per copy, by the title address it starts
+/// at, since the last line: its bytes, whether it is a window, the owned
+/// pieces refreshed by runs, the runs, their bytes and the longest.
+#[cfg(feature = "diagnostics")]
+static OWN_RUNS_BY: Mutex<BTreeMap<u64, (u64, bool, u64, u64, u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// With [`own_wc`] (diagnostics): an owned piece of the copy at `start`
+/// (`len` bytes, a window or not) was refreshed with `runs` changed runs of
+/// `bytes` in all, the longest `longest`. Said in [`own_say`], the copies
+/// with the most runs first: which memory the CPU writes finely beside
+/// what shaders wrote.
+pub(crate) fn own_runs_in(start: u64, len: u64, window: bool, runs: u64, bytes: u64, longest: u64) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut by = OWN_RUNS_BY.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.entry(start).or_insert((len, window, 0, 0, 0, 0));
+        e.2 += 1;
+        e.3 += runs;
+        e.4 += bytes;
+        e.5 = e.5.max(longest);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (start, len, window, runs, bytes, longest);
+}
 
 /// Adds `n` to an [`OwnCount`] (diagnostics).
 pub(crate) fn own_count(c: OwnCount, n: u64) {
@@ -161,9 +220,28 @@ pub(crate) fn own_say() {
             return;
         }
         let c: Vec<u64> = OWN_COUNTS.iter().map(|c| c.swap(0, Relaxed)).collect();
+        let by = std::mem::take(&mut *OWN_RUNS_BY.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut by: Vec<_> = by.into_iter().collect();
+        by.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.3));
+        let most: Vec<String> = by
+            .iter()
+            .take(6)
+            .map(|(at, v)| {
+                format!(
+                    "{at:#x}+{:#x}{}: {} pieces, {} runs, {} bytes, longest {}",
+                    v.0,
+                    if v.1 { " (window)" } else { "" },
+                    v.2,
+                    v.3,
+                    v.4,
+                    v.5
+                )
+            })
+            .collect();
         tracing::info!(
-            "VICTORY_OWN=wc in 5 s: {} pieces ({} MB) left on the card; {} changed runs ({} KB) sent up to owned pieces, {} whole-piece uploads avoided ({} MB not sent); {} pieces ({} KB) fetched for readers of ours, {} settles for them; came back as before: {} aliased, {} read by us, {} in descriptor heaps",
-            c[0], c[1] >> 20, c[2], c[3] >> 10, c[4], c[5] >> 20, c[6], c[7] >> 10, c[8], c[9], c[10], c[11]
+            "VICTORY_OWN=wc in 5 s: {} pieces ({} MB) left on the card; {} changed runs ({} KB) sent up to owned pieces, {} whole-piece uploads avoided ({} MB not sent); {} pieces no longer owned for more than {} runs; {} pieces ({} KB) fetched for readers of ours, {} settles for them; came back as before: {} aliased ({} aliased owned with VICTORY_OWN_ALIASED=1), {} read by us, {} in descriptor heaps; the copies with the most runs: {}",
+            c[0], c[1] >> 20, c[2], c[3] >> 10, c[4], c[5] >> 20, c[6], own_runs_cap(), c[8], c[9] >> 10, c[10], c[11], c[7], c[12], c[13],
+            if most.is_empty() { "-".to_owned() } else { most.join("; ") }
         );
     }
 }
