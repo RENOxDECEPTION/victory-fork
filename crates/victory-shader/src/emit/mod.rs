@@ -82,6 +82,7 @@
 
 mod bitcode;
 mod container;
+mod group_reach;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]

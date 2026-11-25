@@ -953,3 +953,197 @@ fn an_lds_region_reading_what_its_atomics_change_keeps_64_lanes() {
     // host wave added first
     assert_eq!(flag_wave(&lds_regions_program(8)), Some(64));
 }
+
+/// The thread group of two console waves (128 threads, the thread index in v0) that the
+/// title's large tiled programs have: an early-out too far for a branch (`s_cbranch_execnz`
+/// over `s_getpc_b64` / `s_add_u32` / `s_addc_u32` / `s_setpc_b64` to the end) for the threads
+/// at or past s0; then a test of whether every lane of the console wave left has `t != s1`
+/// (a bit count of the lanes that do not), which steers a branch the console wave takes on
+/// its own (`s_cbranch_vccz` on that count broadcast as a mask); then, if some lane of the
+/// console wave has `t == s2`, its first lane alone sets bit 14 of dword s3 (a load, a
+/// first-lane read of it, the store).
+///
+/// The two console waves of a group go different ways at both branches, and one of them may
+/// have no lane left at all, so a group barrier inside either would wait for threads that
+/// never come. The exchanges stay where every thread of the group gets to (the count, the
+/// test for some lane), and the first-lane read inside needs none (`group_reach`). Each
+/// thread below s0 stores 1 where its console wave passed the test, else 2.
+/// `read`: the first-lane read (`v_readfirstlane_b32 s28, v5`, the loaded dword).
+fn two_wave_program(read: u32) -> NativeProgram {
+    let mut w: Vec<u32> = vec![
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: the threads below s0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF89_0000, // s_cbranch_execnz to the body (patched)
+        0xBE8E_1F00, // s_getpc_b64 s[14:15]
+        0x800E_FF0E, // s_add_u32 s14, s14, lit (patched): the end
+        0,
+        0x820F_800F, // s_addc_u32 s15, s15, 0
+        0xBE80_200E, // s_setpc_b64 s[14:15]
+    ];
+    let enter = 2;
+    let getpc = 3;
+    let far = 5;
+    let body = w.len();
+    w.extend_from_slice(&[
+        0x7D8A_0001, // v_cmp_ne_u32 vcc, s1, v0
+        0x8790_7E6A, // s_and_b64 s[16:17], vcc, exec
+        0x8990_7E10, // s_xor_b64 s[16:17], s[16:17], exec: the lanes left with t == s1
+        0xBE92_1010, // s_bcnt1_i32_b64 s18, s[16:17]
+        0x8514_8180, // s_cselect_b32 s20, 0, 1: 1 when there are none
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D8A_0414, // v_cmp_ne_u32 vcc, s20, v2
+        0xBE96_046A, // s_mov_b64 s[22:23], vcc
+        0x87EA_167E, // s_and_b64 vcc, exec, s[22:23]
+        0xBF86_0000, // s_cbranch_vccz to the other arm (patched)
+        0x7E02_0281, // v_mov_b32 v1, 1
+        0xBF82_0000, // s_branch to the join (patched)
+    ]);
+    let vccz = w.len() - 3;
+    let over = w.len() - 1;
+    let other = w.len();
+    w.push(0x7E02_0282); // v_mov_b32 v1, 2
+    let join = w.len();
+    w.extend_from_slice(&[
+        0x341C_0082, // v_lshlrev_b32 v14, 2, v0
+        0xE070_1000,
+        0x8002_010E, // buffer_store_dword v1, v14, s[8:11], 0 offen
+        0x7D84_0002, // v_cmp_eq_u32 vcc, s2, v0
+        0xBE98_106A, // s_bcnt1_i32_b64 s24, vcc: SCC, some lane left has t == s2
+        0xBF84_0000, // s_cbranch_scc0 past the update (patched)
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0003,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v3, -1, v3: the lane
+        0xBE99_147E, // s_ff1_i32_b64 s25, exec: the first lane left
+        0xBE9A_047E, // s_mov_b64 s[26:27], exec
+        0x7DA4_0619, // v_cmpx_eq_u32 exec, s25, v3
+        0xBF88_0000, // s_cbranch_execz past the update (patched)
+        0x7E0C_0203, // v_mov_b32 v6, s3
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xE030_1000,
+        0x8002_0506, // buffer_load_dword v5, v6, s[8:11], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        read,
+        0x881C_FF1C, // s_or_b32 s28, s28, lit
+        1 << 14,
+        0x7E0A_021C, // v_mov_b32 v5, s28
+        0xE070_1000,
+        0x8002_0506, // buffer_store_dword v5, v6, s[8:11], 0 offen
+    ]);
+    let scc0 = join + 5;
+    let execz = join + 13;
+    let restore = w.len();
+    w.push(0xBEFE_041A); // s_mov_b64 exec, s[26:27]
+    let past = w.len();
+    w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    // branch offsets in dwords from the instruction after the branch
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[enter] |= rel(enter, body);
+    w[vccz] |= rel(vccz, other);
+    w[over] |= rel(over, join);
+    w[scc0] |= rel(scc0, past);
+    w[execz] |= rel(execz, restore);
+    // the end: the `s_endpgm` after the body (3 prologue dwords before `w`), from the
+    // address after `s_getpc_b64`
+    let end = 3 + w.len();
+    w[far] = (4 * (end - (3 + getpc + 1))) as u32;
+    native_of(&w, true, 128)
+}
+
+#[test]
+fn barriers_stay_where_every_console_wave_of_the_group_gets_to() {
+    const OF_V5: u32 = 0x7E38_0505; // v_readfirstlane_b32 s28, v5
+    let native = two_wave_program(OF_V5);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    for n in ["s_setpc_b64", "s_cbranch_execnz", "s_bcnt1_i32_b64", "s_cbranch_vccz", "v_readfirstlane_b32", "buffer_load_dword"] {
+        assert!(names.contains(&n), "{n} in {names:?}");
+    }
+    // the far jump is a jump to the end, which the early-out goes to
+    assert!(p.blocks.iter().any(|b| b.insts.last().is_some_and(|i| i.name() == "s_setpc_b64")
+        && matches!(b.exit, ir::Exit::Jump(t) if p.blocks[t].insts.iter().all(|i| i.name() == "s_endpgm"))));
+    // As it is, the program's every exchange is inside the early-out's lane branch.
+    let refused = lowered(&native, &p, &HashSet::new()).expect_err("exchanges under the early-out");
+    assert!(
+        matches!(refused, ShaderError::Unsupported { what, .. } if lower::needs_every_lane(what)),
+        "{refused:?}"
+    );
+    // Without the early-out and the skip around the update, it runs in waves of 32. Not with a
+    // first-lane read of a value that differs lane by lane (v_readfirstlane_b32 s28, v3): that
+    // one needs the other host wave, through a group barrier, under a branch the two console
+    // waves may take differently.
+    let other = two_wave_program(0x7E38_0503);
+    let q = ir::build(&other.code, other.wave64, other.vgprs).expect("ir::build");
+    let q = ir::without_skips(&q, true).expect("the early-out and the skip left out");
+    let refused = lowered(&other, &q, &HashSet::new()).expect_err("a barrier under a branch of one console wave");
+    assert!(
+        matches!(refused, ShaderError::Unsupported { what, .. } if what == "a first-lane read where not every lane runs"),
+        "{refused:?}"
+    );
+    let p = ir::without_skips(&p, true).expect("the early-out and the skip left out");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    const RECORD: u32 = 200;
+    // (s0, s1, s2): both console waves pass, one fails, one has no lane left, the update
+    // by one console wave, by none
+    for (s0, s1, s2) in [(128, 200, 5), (128, 100, 5), (50, 10, 77), (100, 99, 99), (70, 200, 3), (0, 0, 0)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=3) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [s0, s1, s2, RECORD][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let want: Vec<u32> = (0..256u32)
+            .map(|t| {
+                if t == RECORD {
+                    if s2 < s0.min(128) { 1 << 14 } else { 0 }
+                } else if t < s0.min(128) {
+                    let wave = t >> 6;
+                    let fails = s1 < s0 && s1 >> 6 == wave;
+                    if fails { 2 } else { 1 }
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let wrong: Vec<(usize, u32, u32)> = out[0]
+            .iter()
+            .zip(&want)
+            .enumerate()
+            .filter(|(_, (got, want))| got != want)
+            .map(|(t, (&got, &want))| (t, got, want))
+            .take(8)
+            .collect();
+        assert!(wrong.is_empty(), "s0 {s0}, s1 {s1}, s2 {s2}: threads (index, got, want): {wrong:?}");
+    }
+    eprintln!("ran on the hardware device: every thread's console wave decided as the console does");
+}

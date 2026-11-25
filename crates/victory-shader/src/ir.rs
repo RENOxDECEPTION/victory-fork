@@ -385,19 +385,31 @@ fn unspill(
             None
         }
     };
+    // A pair of lanes gets neighbouring codes, and each save or restore of the lower lane that
+    // has its partner moves both; the others (the compiler reuses a lane for a lone scalar
+    // elsewhere in the program) move one, into the same codes, so every move still reads and
+    // writes what the lane would hold.
     let mut pairs: Vec<(u8, u32)> = Vec::new();
     for &(reg, lane) in &slots {
         if !wave64 || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane) || !slots.contains(&(reg, lane + 1)) {
             continue;
         }
         let lower: Vec<usize> = (0..list.len()).filter(|&i| parks[i].is_some_and(|p| (p.1, p.3) == (reg, lane))).collect();
-        let upper = parks.iter().flatten().filter(|p| (p.1, p.3) == (reg, lane + 1)).count();
-        let partners: Vec<Option<usize>> = lower.iter().map(|&i| partner(i)).collect();
-        let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
+        let partners: Vec<usize> = lower.iter().filter_map(|&i| partner(i)).collect();
+        let mut distinct = partners.clone();
         distinct.sort_unstable();
         distinct.dedup();
-        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
+        if !partners.is_empty() && distinct.len() == partners.len() {
             pairs.push((reg, lane));
+        }
+    }
+    // the upper-lane moves that go with their lower lane's
+    let mut moved: Vec<usize> = Vec::new();
+    for i in 0..list.len() {
+        if parks[i].is_some_and(|p| pairs.contains(&(p.1, p.3)))
+            && let Some(j) = partner(i)
+        {
+            moved.push(j);
         }
     }
     // Codes for the parked scalars: the trap temporaries (108..=123), then
@@ -450,15 +462,16 @@ fn unspill(
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
-        if pairs.contains(&(reg, lane)) {
-            let Some(j) = partner(i) else { return Vec::new() };
+        if pairs.contains(&(reg, lane))
+            && let Some(j) = partner(i)
+        {
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
+        } else if moved.contains(&i) {
             // the upper half of a pair: moved with the lower
         } else {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
@@ -590,19 +603,12 @@ pub(crate) fn thread_edges(
 /// waves needs for the barriers of its exchanges and LDS accesses.
 /// `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for block in &mut blocks {
-        let Exit::Branch { taken, not_taken } = block.exit else {
-            continue;
-        };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
-            block.insts.pop();
-            block.exit = Exit::Jump(not_taken);
+    for b in 0..blocks.len() {
+        if let Some(body) = early_out(p, b) {
+            blocks[b].insts.pop();
+            blocks[b].exit = Exit::Jump(body);
             any = true;
         }
     }
@@ -612,9 +618,37 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     for block in &mut blocks {
         block.phis.clear();
     }
+    drop_unreachable(&mut blocks);
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
     Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// The block the lanes still in EXEC go on to, if block `b` ends in an early-out: an
+/// `s_cbranch_execz` to a block that only ends the program, or the far form a body too long
+/// for a branch's 16-bit offset takes, an `s_cbranch_execnz` over a far jump
+/// (`s_getpc_b64`, `s_add_u32`, `s_addc_u32`, `s_setpc_b64`, nothing else) to such a block,
+/// the jump reached from that branch only. Either way the wave leaves only when no lane is left.
+fn early_out(p: &Program, b: usize) -> Option<usize> {
+    let ends = |b: usize| {
+        p.blocks[b].exit == Exit::End
+            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+    };
+    let far_end = |j: usize| {
+        let blk = &p.blocks[j];
+        let names: Vec<&str> = blk.insts.iter().map(Inst::name).collect();
+        blk.preds == [b]
+            && names == ["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"]
+            && matches!(blk.exit, Exit::Jump(t) if ends(t))
+    };
+    let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+        return None;
+    };
+    match p.blocks[b].insts.last()?.name() {
+        "s_cbranch_execz" if ends(taken) => Some(not_taken),
+        "s_cbranch_execnz" if ends(not_taken) || far_end(not_taken) => Some(taken),
+        _ => None,
+    }
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -638,13 +672,7 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let n = p.blocks.len();
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
-    // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
-    // comes back by such a move, `unspill`) are the value they copy.
-    let mut copy: std::collections::HashMap<Value, Value> = Default::default();
+    let copy = if deep { copies(p) } else { Default::default() };
     // Values something reads, directly or through joins. A scalar operation none of whose
     // results is read reads nothing either (the compiler restores EXEC from a saved mask
     // and overwrites it at once where two branches end together).
@@ -660,16 +688,6 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 || name.starts_with("s_subvector"))
             && inst.writes.iter().all(|w| !live.contains(&w.1))
     };
-    for block in &p.blocks {
-        for inst in &block.insts {
-            if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
-                && inst.reads.len() == inst.writes.len()
-                && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
-            {
-                copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
-            }
-        }
-    }
     let mut changed = true;
     while changed {
         changed = false;
@@ -690,12 +708,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
         }
     }
-    let root = |mut v: Value| {
-        while deep && let Some(&c) = copy.get(&v) {
-            v = c;
-        }
-        v
-    };
+    let root = |v: Value| if deep { copy_root(&copy, v) } else { v };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -749,15 +762,16 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let mut blocks = p.blocks.clone();
     let mut any = false;
     for b in 0..n {
-        let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
-            continue;
-        };
-        if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
-            continue;
-        }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        let body = early_out(p, b).or_else(|| {
+            let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+                return None;
+            };
+            let execz = p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
+            (execz && skipped(b, taken, not_taken).is_some()).then_some(not_taken)
+        });
+        if let Some(body) = body {
             blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(not_taken);
+            blocks[b].exit = Exit::Jump(body);
             any = true;
         }
     }
@@ -767,9 +781,89 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     for block in &mut blocks {
         block.phis.clear();
     }
+    drop_unreachable(&mut blocks);
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
     Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// Scalar values that are another value: a scalar moved from register to register (a scalar
+/// the compiler parked in a VGPR lane comes back by such a move, `unspill`) is the value it
+/// copies, and so is a join of only copies of one value ([`copy_phis`]). By value, the value
+/// it is a copy of (follow with [`copy_root`]).
+pub(crate) fn copies(p: &Program) -> std::collections::HashMap<Value, Value> {
+    let mut copy = std::collections::HashMap::new();
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+            && inst.reads.len() == inst.writes.len()
+            && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
+        {
+            copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
+        }
+    }
+    copy_phis(p, &mut copy);
+    copy
+}
+
+/// The value `v` copies (`copy`, followed to its end).
+pub(crate) fn copy_root(copy: &std::collections::HashMap<Value, Value>, mut v: Value) -> Value {
+    // (bounded: a cycle of copies would otherwise never end)
+    for _ in 0..=copy.len() {
+        match copy.get(&v) {
+            Some(&c) => v = c,
+            None => break,
+        }
+    }
+    v
+}
+
+/// Adds to `copy` the scalar joins that only join one value: every way in brings the same
+/// value, or a copy of it, or the join's own value back round a loop. The compiler parks a
+/// scalar it needs later, uses its register for other things inside a branch and takes it back
+/// on every path before the join; inner joins of such a region then join only copies. Taken
+/// one at a time until nothing changes, so a join of such joins is found too.
+fn copy_phis(p: &Program, copy: &mut std::collections::HashMap<Value, Value>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if !matches!(phi.reg, Reg::S(_) | Reg::Scc) || copy.contains_key(&phi.value) {
+                continue;
+            }
+            let mut one = None;
+            let mut single = true;
+            for &a in &phi.args {
+                let r = copy_root(copy, a);
+                if r == phi.value {
+                    continue;
+                }
+                match one {
+                    None => one = Some(r),
+                    Some(o) if o == r => {}
+                    Some(_) => single = false,
+                }
+            }
+            if single && let Some(r) = one {
+                copy.insert(phi.value, r);
+                changed = true;
+            }
+        }
+    }
+}
+
+/// Empties the blocks no way from the entry reaches any more (the far jump of an early-out
+/// left out): they run nothing, and renaming does not visit them.
+fn drop_unreachable(blocks: &mut [Block]) {
+    let mut seen = vec![false; blocks.len()];
+    for b in reverse_postorder(blocks) {
+        seen[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        if !seen[b] {
+            block.insts.clear();
+            block.exit = Exit::End;
+        }
+    }
 }
 
 /// Placeholder before renaming.
@@ -1605,6 +1699,105 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn a_skip_is_left_out_when_every_inner_path_puts_the_scalar_back() {
+        // s6 is changed, then put back on both arms of an inner branch before the join
+        let body = [
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 to the second arm
+            0xBE86_0314, // s_mov_b32 s6, s20
+            0xBF82_0001, // s_branch past it
+            0xBE86_0314, // s_mov_b32 s6, s20
+        ];
+        let p = skip(&body, &[0x7E04_0206]); // v_mov_b32 v2, s6 after the join
+        assert_eq!(skips(&p), 1);
+        assert!(without_skips(&p, false).is_none());
+        assert_eq!(skips(&without_skips(&p, true).expect("left out")), 0);
+        // (the inner join's s6 is a copy of the s6 from before the branch)
+        let copy = copies(&p);
+        let before = p.blocks[0].insts[0].read(Reg::S(6)).unwrap();
+        let inner = p.blocks.iter().flat_map(|b| &b.phis).find(|phi| phi.reg == Reg::S(6)).expect("a join of s6");
+        assert_eq!(copy_root(&copy, inner.value), before);
+    }
+
+    /// `if (v0 >= s0) return;` over a body too long for a branch: `s_cbranch_execnz` over a far
+    /// jump to the end; `tail` after the body, before `s_endpgm`.
+    fn far_early_out(tail: &[u32]) -> Program {
+        let mut w = vec![
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF89_0005, // s_cbranch_execnz to the body
+            0xBE8E_1F00, // s_getpc_b64 s[14:15]
+            0x800E_FF0E, // s_add_u32 s14, s14, lit: the end
+            0,
+            0x820F_800F, // s_addc_u32 s15, s15, 0
+            0xBE80_200E, // s_setpc_b64 s[14:15]
+            0x7E02_0200, // the body: v_mov_b32 v1, s0
+        ];
+        w.extend_from_slice(tail);
+        // from the address after s_getpc_b64 to the end: the `s_endpgm`, or a block of `tail`
+        w[5] = 4 * (w.len() as u32 - tail.len() as u32 - 4);
+        w.push(S_ENDPGM);
+        build_words(&w, true)
+    }
+
+    #[test]
+    fn a_far_early_out_is_left_out() {
+        let p = far_early_out(&[]);
+        let execnz = |p: &Program| p.blocks.iter().filter(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz")).count();
+        assert_eq!(execnz(&p), 1);
+        let q = without_early_outs(&p).expect("the early-out left out");
+        assert_eq!(execnz(&q), 0);
+        // every lane walks into the body
+        assert_eq!(q.blocks[0].exit, Exit::Jump(q.blocks.iter().position(|b| b.insts.first().is_some_and(|i| i.name() == "v_mov_b32")).unwrap()));
+        assert_eq!(execnz(&without_skips(&p, false).expect("left out")), 0);
+        // a far jump to code (v_mov_b32 v2, s0 before the end) is no early-out
+        assert!(without_early_outs(&far_early_out(&[0x7E04_0200])).is_none());
+    }
+
+    #[test]
+    fn a_lane_pair_moves_as_a_pair_where_its_lower_lane_also_parks_a_lone_scalar() {
+        let w = [
+            0xD761_000A,
+            0x0001_0004, // v_writelane_b32 v10, s4, 0: a lone scalar
+            0xD760_0004,
+            0x0001_010A, // v_readlane_b32 s4, v10, 0
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_046A, // s_mov_b64 s[2:3], vcc: a lane mask
+            0xD761_000A,
+            0x0001_0002, // v_writelane_b32 v10, s2, 0
+            0xD761_000A,
+            0x0001_0203, // v_writelane_b32 v10, s3, 1
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xD760_0002,
+            0x0001_010A, // v_readlane_b32 s2, v10, 0
+            0xD760_0003,
+            0x0001_030A, // v_readlane_b32 s3, v10, 1
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            0x7E02_0204, // v_mov_b32 v1, s4
+            S_ENDPGM,
+        ];
+        let p = build_words(&w, true);
+        let insts: Vec<&Inst> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().all(|i| !i.name().contains("lane")));
+        // the mask comes back whole: one move of both dwords, of what one move put away
+        let back = insts
+            .iter()
+            .find(|i| i.name() == "s_mov_b64" && i.write(Reg::S(2)).is_some() && i.reads.len() == 2 && i.read(Reg::S(106)).is_none())
+            .expect("the pair's restore");
+        let away = insts
+            .iter()
+            .find(|i| i.name() == "s_mov_b64" && i.read(Reg::S(3)).is_some() && i.writes.iter().all(|w| w.0 != Reg::S(2) && w.0 != Reg::S(126)))
+            .expect("the pair's save");
+        assert_eq!(back.reads.iter().map(|r| r.1).collect::<Vec<_>>(), away.writes.iter().map(|w| w.1).collect::<Vec<_>>());
+        // and the lone scalar still comes back
+        let lone = insts.iter().find(|i| i.name() == "v_mov_b32").unwrap();
+        let restore = insts.iter().find(|i| i.name() == "s_mov_b32" && i.write(Reg::S(4)).is_some()).expect("the lone restore");
+        assert_eq!(lone.read(Reg::S(4)), restore.write(Reg::S(4)));
     }
 
     #[test]
