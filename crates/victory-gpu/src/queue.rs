@@ -598,6 +598,9 @@ fn release_held_now(all: bool) {
                         if behind() && !all && batch_most() > 1 {
                             let mut runs = 1;
                             let mut last = None;
+                            // What ended the run of submissions (diagnostics).
+                            static ENDED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+                            let mut ended = 0;
                             for (k, h) in held.iter().enumerate() {
                                 match h {
                                     Held::Signal(..) => {}
@@ -605,8 +608,35 @@ fn release_held_now(all: bool) {
                                         runs += 1;
                                         last = Some(k);
                                     }
-                                    _ => break,
+                                    // A wait for a value that memory holds, or
+                                    // that a submission of the run writes when
+                                    // it has run (as `crate::host::late_met`
+                                    // has it for flights): what follows it
+                                    // goes to the card behind that submission,
+                                    // the order the wait asks for.
+                                    Held::Value(wait)
+                                        if wait.met()
+                                            || lists.iter().any(|l| l.host().will_meet(wait))
+                                            || held[..k].iter().any(|h| matches!(h, Held::Run(l, _) if l.iter().any(|l| l.host().will_meet(wait)))) => {}
+                                    other => {
+                                        ended = match other {
+                                            Held::Wait(..) => 1,
+                                            Held::Value(..) => 2,
+                                            Held::Present(..) => 3,
+                                            Held::Run(..) => 4,
+                                            _ => 5,
+                                        };
+                                        break;
+                                    }
                                 }
+                            }
+                            ENDED[ended].fetch_add(1, Ordering::Relaxed);
+                            if ENDED.iter().map(|e| e.load(Ordering::Relaxed)).sum::<u64>() % 2000 == 0 {
+                                let e: Vec<u64> = ENDED.iter().map(|e| e.swap(0, Ordering::Relaxed)).collect();
+                                tracing::info!(
+                                    "what ended a run of submissions, of 2,000: the line's end {}, a wait for a fence {}, a wait for a memory value {}, a present {}, the most {}, other {}",
+                                    e[0], e[1], e[2], e[3], e[4], e[5]
+                                );
                             }
                             if let Some(last) = last {
                                 let mut signals = Vec::new();

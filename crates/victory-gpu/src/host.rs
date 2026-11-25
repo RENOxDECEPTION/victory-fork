@@ -6468,6 +6468,16 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Whether a bottom-of-pipe write of the list stores a value that
+    /// meets `wait` (as [`late_met`] asks of flights).
+    pub(crate) fn will_meet(&self, wait: &crate::list::ValueWait) -> bool {
+        let (address, bytes) = wait.place();
+        self.deferred()
+            .writes
+            .iter()
+            .any(|(at, what, n)| *at == address && *n >= bytes && matches!(what, crate::queue::Written::Value(v) if wait.holds_for(*v)))
+    }
+
     /// How often shaders of the list were given host copy `id` to write
     /// since its reset.
     pub(crate) fn writes_to(&self, id: u64) -> u32 {
