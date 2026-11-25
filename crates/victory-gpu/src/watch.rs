@@ -685,6 +685,48 @@ fn view_known() -> bool {
     }
 }
 
+/// The guards' kernel calls since the last log line (diagnostics), by
+/// [`KC`]: said every five seconds from [`guard`].
+#[cfg(feature = "diagnostics")]
+static KERNEL_CALLS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// The indices of [`KERNEL_CALLS`].
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum KC {
+    Guards,
+    IsView,
+    RunSet,
+    RunFailed,
+    BlockSet,
+    BlockFailed,
+    Uncommitted,
+    Opened,
+}
+
+fn kc(c: KC) {
+    #[cfg(feature = "diagnostics")]
+    KERNEL_CALLS[c as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = c;
+}
+
+#[cfg(feature = "diagnostics")]
+fn kc_say() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let now = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 5;
+    if SAID.swap(now, Relaxed) == now {
+        return;
+    }
+    let c: Vec<u64> = KERNEL_CALLS.iter().map(|c| c.swap(0, Relaxed)).collect();
+    tracing::info!(
+        "guard kernel calls in 5 s: {} guard passes, {} is-view queries, {} run protects ({} failed), {} block protects ({} failed), {} uncommitted queries, {} blocks opened",
+        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
+    );
+}
+
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: CleanBlocks(BTreeMap::new()),
@@ -720,6 +762,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
+    kc(KC::Guards);
+    #[cfg(feature = "diagnostics")]
+    kc_say();
+    if !known {
+        kc(KC::IsView);
+    }
     if !known && !is_view(start, end) {
         return None;
     }
@@ -1003,14 +1051,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.viewed.extend(from..to);
         }
     };
+    kc(KC::RunSet);
     if set(from, to) {
         note(g, from, to);
         return;
     }
+    kc(KC::RunFailed);
     for block in from..to {
+        kc(KC::BlockSet);
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else {
+            kc(KC::BlockFailed);
             #[cfg(feature = "diagnostics")]
             let error = std::io::Error::last_os_error();
             if block < uncommitted_end(block) {
@@ -1069,6 +1121,7 @@ fn absent_told() -> bool {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    kc(KC::Uncommitted);
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1140,6 +1193,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
+        kc(KC::Opened);
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     !blocks.is_empty()
