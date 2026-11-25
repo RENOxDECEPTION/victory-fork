@@ -5856,11 +5856,6 @@ impl Host {
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-            // What no step of ours changes first, all at once now that the
-            // asking stands (`VICTORY_REFRESH_AHEAD`).
-            if refresh_ahead() {
-                batch.ahead(runs);
-            }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
@@ -7654,82 +7649,6 @@ fn refresh_once() -> bool {
     }
 }
 
-/// Whether a submission brings up to date, as soon as its one asking is
-/// made and on several threads, every range its lists refresh that no
-/// step of its own changes first (`VICTORY_REFRESH_AHEAD=1`; off by
-/// default).
-///
-/// The refreshes ran in the order of the lists' steps, a group at each of
-/// the title's buffer copies and one copy at each range shaders write
-/// (`Batch::flush`, `Batch::flush_one`), on the submit worker alone: in
-/// the profile of the 132 ms frame 41 ms of `Shadow::update` a frame on
-/// it, two thirds of that the guards' walks. The ranges are known when
-/// the submission's one asking is made ([`crate::watch::ask_once`]), so
-/// with the switch they are refreshed then, a copy to a job on the kept
-/// threads (`crate::shadow::wide_run`), guard passes and copies alike.
-/// Meant with `VICTORY_GUARD_SHORT_LOCK=1` and `VICTORY_JOURNAL_SPLIT=1`:
-/// without them the jobs' guard passes take turns on the locks.
-///
-/// What is refreshed ahead ([`ahead_spans`]): for each copy, the span of
-/// the ranges its lists refresh before the first step that may write title
-/// memory anywhere (`Step::Run`, after which nothing counts as up to date
-/// anyway, [`Batch::title_written`]) and before the first range shaders
-/// write in it (`Step::GpuWrite`: past that point a refresh leaves the
-/// ranges given to shaders alone, which it cannot know ahead). Ranges
-/// after those points are refreshed in order, as before. A title buffer
-/// copy of ours (`Step::Copy`) reads title memory and writes it: what it
-/// writes is told to the journal ([`crate::watch::wrote`]) and taken out
-/// of what counts as up to date ([`Batch::title_wrote`]), so the steps
-/// after it take those bytes again.
-///
-/// What changes: memory refreshed ahead is read when the submission
-/// starts, not at its step, as `VICTORY_REFRESH_ONCE` and
-/// `VICTORY_ASK_ONCE` already have it. The later steps' refreshes still
-/// run: with `VICTORY_REFRESH_ONCE=1` the ranges refreshed ahead count as
-/// up to date and are skipped ([`Batch::brought`]); without it each asks
-/// again and finds what was written since (little, and the guards' walk
-/// finds the blocks clean). Needs `VICTORY_ASK_ONCE` (on by default):
-/// without it there is no point at which the ranges are known.
-/// Not run yet.
-fn refresh_ahead() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_some_and(|v| v == "1"))
-}
-
-/// A step as [`ahead_spans`] sees it, `K` naming a host copy.
-enum Ahead<K> {
-    /// A range (from, to) of the copy is refreshed.
-    Refresh(K, usize, usize),
-    /// Shaders write a range of the copy.
-    GpuWrite(K),
-    /// Title memory may be written anywhere.
-    Run,
-    /// Anything else.
-    Other,
-}
-
-/// With [`refresh_ahead`]: by copy, the span of the ranges refreshed
-/// before the first `Run` and before the copy's first `GpuWrite`, the
-/// steps in submission order.
-fn ahead_spans<K: Copy + Eq + std::hash::Hash>(steps: impl IntoIterator<Item = Ahead<K>>) -> std::collections::HashMap<K, (usize, usize)> {
-    let mut spans: std::collections::HashMap<K, (usize, usize)> = std::collections::HashMap::new();
-    let mut written = std::collections::HashSet::new();
-    for step in steps {
-        match step {
-            Ahead::Run => break,
-            Ahead::GpuWrite(key) => {
-                written.insert(key);
-            }
-            Ahead::Refresh(key, from, to) if from < to && !written.contains(&key) => {
-                let span = spans.entry(key).or_insert((from, to));
-                *span = (span.0.min(from), span.1.max(to));
-            }
-            Ahead::Refresh(..) | Ahead::Other => {}
-        }
-    }
-    spans
-}
-
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -7821,54 +7740,6 @@ impl Batch {
         }
     }
 
-    /// With [`refresh_ahead`]: refreshes, on the kept threads, what
-    /// [`ahead_spans`] picks of the steps of `runs` (copies that are not
-    /// write-watched are left to their steps, as for the asking).
-    fn ahead(&mut self, runs: &[&HostList]) {
-        let mut shadows = std::collections::HashMap::new();
-        let mut steps = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                steps.push(match step {
-                    Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
-                        let key = std::sync::Arc::as_ptr(shadow) as usize;
-                        shadows.entry(key).or_insert_with(|| shadow.clone());
-                        Ahead::Refresh(key, *address, *address + *len)
-                    }
-                    Step::GpuWrite(shadow, ..) => Ahead::GpuWrite(std::sync::Arc::as_ptr(shadow) as usize),
-                    Step::Run(_) => Ahead::Run,
-                    _ => Ahead::Other,
-                });
-            }
-        }
-        let refreshes: Vec<_> = ahead_spans(steps)
-            .into_iter()
-            .filter_map(|(key, (from, to))| Some((shadows.get(&key)?.clone(), from, to)))
-            .collect();
-        // Noted now: nothing reads the notes before the jobs are done.
-        for (shadow, from, to) in &refreshes {
-            Self::brought(&mut self.current, shadow, *from, *to);
-        }
-        Self::update_wide(refreshes);
-    }
-
-    /// [`Batch::update`] of each of `refreshes` (one to a copy), on the
-    /// kept threads. The time counted is the time it took, not the
-    /// threads' sum.
-    fn update_wide(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
-        let started = std::time::Instant::now();
-        let before = PREPARING[0].load(Ordering::Relaxed);
-        let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
-            .into_iter()
-            .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-            .collect();
-        crate::shadow::wide_run(jobs);
-        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-        let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
-        PREPARING[0].fetch_sub(over, Ordering::Relaxed);
-        crate::framelog::sub(crate::framelog::T::CopyUs, over);
-    }
-
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
@@ -7937,11 +7808,23 @@ impl Batch {
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
+            // The time counted is the time it took, not the threads' sum.
+            let started = std::time::Instant::now();
+            let before = PREPARING[0].load(Ordering::Relaxed);
             // Noted now: nothing reads the notes before the jobs are done.
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
             }
-            Self::update_wide(self.refreshes.drain(..).collect());
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                .refreshes
+                .drain(..)
+                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .collect();
+            crate::shadow::wide_run(jobs);
+            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+            let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
+            PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+            crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -9324,32 +9207,6 @@ mod spare {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    /// `VICTORY_REFRESH_AHEAD`: a copy is refreshed ahead over the ranges
-    /// its lists refresh before shaders are given a range of it, nothing
-    /// after the first step that may write title memory anywhere, and the
-    /// other copies' ranges past such a write of one copy still are.
-    #[test]
-    fn refresh_ahead_stops_at_a_copys_gpu_write_and_at_a_run() {
-        use super::{Ahead, ahead_spans};
-        let spans = ahead_spans([
-            Ahead::Refresh(1, 100, 200),
-            Ahead::Refresh(2, 0, 50),
-            Ahead::Other,
-            Ahead::Refresh(1, 300, 400),
-            Ahead::GpuWrite(1),
-            // Past the copy's own shader write: left to its step.
-            Ahead::Refresh(1, 0, 1000),
-            Ahead::Refresh(2, 60, 80),
-            Ahead::Refresh(3, 5, 5),
-            Ahead::Run,
-            Ahead::Refresh(2, 0, 4000),
-            Ahead::Refresh(4, 0, 10),
-        ]);
-        let mut spans: Vec<_> = spans.into_iter().collect();
-        spans.sort_unstable();
-        assert_eq!(spans, [(1, (100, 400)), (2, (0, 80))]);
-    }
-
     use super::Batch;
     use std::sync::Arc;
 
