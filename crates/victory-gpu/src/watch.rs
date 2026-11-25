@@ -745,10 +745,64 @@ pub(crate) fn clean(page: usize) -> bool {
     guards().clean.contains(&page)
 }
 
+/// Whether a pass of [`guard`] lets go of the guards' lock between its
+/// steps (`VICTORY_GUARD_SHORT_LOCK=1`; off by default).
+///
+/// The pass held the lock from its first block to its last, every
+/// `VirtualProtect` and `VirtualQuery` of it included, and the title's
+/// write-fault handler (`install`) takes the same lock: a title thread
+/// that wrote a guarded block waited for the submit worker's whole pass
+/// (27.6 ms a frame of guard passes on the worker in the profile of the
+/// 132 ms frame). With the switch the lock is let go after each run of
+/// blocks made read-only (`protect`) and at the end of each gap between
+/// clean runs, so the handler waits for one step at most.
+///
+/// Why no write is lost: a block is noted clean only in the same hold of
+/// the lock in which it is read-only and noted guarded (`protect_here`
+/// makes it read-only first, or it was guarded already), and the
+/// `VICTORY_ALIAS_LAZY` groups noted clean in a step are made read-only
+/// again before the lock is let go. So whenever the lock is free, a block
+/// noted clean is read-only at every view, a write to it faults, and the
+/// handler (under the lock) opens it and takes its clean note away: the
+/// next pass reports it. A write that lands before a block's protect is
+/// before the caller's copy, which follows the pass. What the pass looked
+/// up before letting go (the gaps of `clean`) can only be out of date in
+/// the safe direction: a block of a gap noted clean since by another pass
+/// is still read-only, and is reported again (over-reported); a clean
+/// block skipped and opened since is not clean, for the next pass.
+/// Not run yet: `std`'s mutex is not fair, so whether the handler really
+/// gets in between two steps of a busy pass is for a run to show.
+fn guard_short_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_SHORT_LOCK").is_some_and(|v| v == "1"))
+}
+
+/// Between two steps of a pass of [`guard`] (`VICTORY_GUARD_SHORT_LOCK`):
+/// the blocks noted clean without a protect have their other views made
+/// read-only again first (the `VICTORY_ALIAS_LAZY` invariant must hold
+/// whenever the lock is free), then the lock is let go and taken again.
+fn guard_step(
+    mut g: std::sync::MutexGuard<'static, Guards>,
+    regroup: &mut Vec<usize>,
+) -> std::sync::MutexGuard<'static, Guards> {
+    if !regroup.is_empty() {
+        reprotect_groups(&mut g, regroup);
+        regroup.clear();
+    }
+    drop(g);
+    guards()
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_with(start, end, guard_short_lock())
+}
+
+/// [`guard`], letting go of the lock between steps if `short`
+/// ([`guard_short_lock`]).
+fn guard_with(start: usize, end: usize, short: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -814,10 +868,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             if let Some(begin) = run.take() {
                 protect(&mut g, begin, block);
+                if short {
+                    g = guard_step(g, &mut regroup);
+                }
             }
         }
         if let Some(begin) = run {
             protect(&mut g, begin, to);
+        }
+        if short {
+            g = guard_step(g, &mut regroup);
         }
     }
     if !regroup.is_empty() {
@@ -1978,6 +2038,91 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         title_memory_remapped(filler, MANY_VIEWS * BLOCK);
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A view of `bytes` of a fresh pagefile section, for a test alone; the
+    /// section handle and the address.
+    fn one_view(bytes: usize) -> (usize, usize) {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a fresh pagefile section, mapped read-write once.
+        unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, bytes as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
+            assert_ne!(view, 0);
+            (section as usize, view)
+        }
+    }
+
+    /// A title thread writes the view all the while a copy of it is
+    /// refreshed again and again from what the guard passes report, the
+    /// copy taken after each pass: once the writes stop, one more pass and
+    /// copy leave the copy equal to the view. `pass` makes one pass and
+    /// gives the pages it reports.
+    fn no_write_is_lost(view: usize, size: usize, pass: impl Fn() -> Vec<usize>) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+        let words = size / 8;
+        // SAFETY: the view is ours, `size` bytes, aligned; the words are
+        // only touched atomically from here on.
+        let title: &'static [AtomicU64] = unsafe { std::slice::from_raw_parts(view as *const AtomicU64, words) };
+        let mut copy = vec![0u64; words];
+        let take = |copy: &mut [u64], pages: &[usize]| {
+            for &page in pages {
+                let (a, e) = ((page * PAGE).max(view), ((page + 1) * PAGE).min(view + size));
+                for at in (a..e).step_by(8) {
+                    copy[(at - view) / 8] = title[(at - view) / 8].load(Relaxed);
+                }
+            }
+        };
+        take(&mut copy, &pass());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut n = 1u64;
+                while !stop.load(Relaxed) {
+                    // Spread over every block, a few words a block.
+                    let at = (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 7) as usize % words;
+                    title[at].store(n, Relaxed);
+                    n += 1;
+                }
+            })
+        };
+        for _ in 0..200 {
+            let pages = pass();
+            take(&mut copy, &pages);
+        }
+        stop.store(true, Relaxed);
+        writer.join().unwrap();
+        let pages = pass();
+        take(&mut copy, &pages);
+        for (i, word) in title.iter().enumerate() {
+            assert_eq!(copy[i], word.load(Relaxed), "a write at {:#x} was lost", view + i * 8);
+        }
+    }
+
+    /// `VICTORY_GUARD_SHORT_LOCK`: with the lock let go between the steps
+    /// of a pass, a title thread writing all the while loses no write.
+    #[test]
+    fn a_pass_letting_go_between_steps_loses_no_write() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        const SIZE: usize = 8 * BLOCK;
+        let (section, view) = one_view(SIZE);
+        // Blocks 2 and 5 written through the runtime between passes keep
+        // the pass in several gaps and steps.
+        no_write_is_lost(view, SIZE, || {
+            writing(view + 2 * BLOCK, 8);
+            writing(view + 5 * BLOCK, 8);
+            guard_with(view, view + SIZE, true).expect("a view")
+        });
+        title_memory_remapped(view, SIZE);
+        // SAFETY: the view and section of `one_view`.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            CloseHandle(section as *mut std::ffi::c_void);
+        }
     }
 
     /// A write or mapping that runs past the end of the address space (a
