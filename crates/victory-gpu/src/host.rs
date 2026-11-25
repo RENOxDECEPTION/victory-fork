@@ -589,6 +589,12 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // Every VICTORY_* switch and its value, sorted, so a run log shows what was set.
+    let mut switches: Vec<(String, String)> =
+        std::env::vars().filter(|(k, _)| k.starts_with("VICTORY_")).collect();
+    switches.sort();
+    let switches: Vec<String> = switches.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+    tracing::info!("VICTORY_* switches: {}", switches.join(" "));
     crate::drvwatch::start();
     crate::spread::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
@@ -3178,6 +3184,14 @@ fn land() {
     }
 }
 
+/// `VICTORY_WAKE_FIRST=1`: [`late_helper`] wakes the submit worker before
+/// it recycles the lists of settled flights, so the worker starts the next
+/// submission meanwhile (off by default).
+fn wake_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAKE_FIRST").is_some_and(|v| v == "1"))
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3209,8 +3223,13 @@ fn late_helper() {
             }
         };
         let Some(target) = target else {
-            land();
-            crate::queue::release_held(false);
+            if wake_first() {
+                crate::queue::release_held(false);
+                land();
+            } else {
+                land();
+                crate::queue::release_held(false);
+            }
             continue;
         };
         // The card first, without the submission lock: the submitting
@@ -3230,8 +3249,13 @@ fn late_helper() {
             }
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
-        land();
-        crate::queue::release_held(false);
+        if wake_first() {
+            crate::queue::release_held(false);
+            land();
+        } else {
+            land();
+            crate::queue::release_held(false);
+        }
     }
 }
 
@@ -3502,6 +3526,10 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+        let [unwatched, no_journal, over_cap, no_snapshot] = crate::shadow::merge_settle_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "settles asked for by the merge under flights per frame, by cause: memory not write-watched {unwatched:.2},              no journal of writes {no_journal:.2}, over the changed-runs cap (VICTORY_MERGE_RUNS) {over_cap:.2},              no snapshot for a copy outside the card {no_snapshot:.2}"
         );
     }
 }
