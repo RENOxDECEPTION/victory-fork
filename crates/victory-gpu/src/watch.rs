@@ -2216,7 +2216,7 @@ mod tests {
         no_write_is_lost(view, SIZE, || {
             writing(view + 2 * BLOCK, 8);
             writing(view + 5 * BLOCK, 8);
-            guard_with(view, view + SIZE, true, false).expect("a view")
+            guard_with(view, view + SIZE, true).expect("a view")
         });
         title_memory_remapped(view, SIZE);
         // SAFETY: the view and section of `one_view`.
@@ -2243,13 +2243,13 @@ mod tests {
         let title: &'static [AtomicU64] = unsafe { std::slice::from_raw_parts(view as *const AtomicU64, SIZE / 8) };
         /// A host copy of `[from, to)` of the view: its words and, by
         /// page, the asking it last copied the page at (as `Shadow`).
-        struct HostCopy {
+        struct Copy {
             from: usize,
             to: usize,
             words: Vec<u64>,
             copied: BTreeMap<usize, u64>,
         }
-        let refresh = |copy: &mut HostCopy, view: usize| {
+        let refresh = |copy: &mut Copy, view: usize| {
             let (now, written) = writes_with(copy.from, copy.to, true, true).expect("a view");
             let written: BTreeMap<usize, u64> = written.into_iter().collect();
             for page in copy.from / PAGE..copy.to.div_ceil(PAGE) {
@@ -2263,7 +2263,7 @@ mod tests {
                 }
             }
         };
-        let new = |from: usize, to: usize| HostCopy {
+        let new = |from: usize, to: usize| Copy {
             from: view + from * BLOCK,
             to: view + to * BLOCK,
             words: vec![0; (to - from) * BLOCK / 8],
