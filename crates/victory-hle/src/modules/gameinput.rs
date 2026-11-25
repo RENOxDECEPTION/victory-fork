@@ -1171,8 +1171,13 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // Down now, or pressed since the last look (the low bit): a title that
+                    // asks once a frame at a frame a second still sees a tap between two asks.
                     // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    .filter(|&vk| {
+                        let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+                        state < 0 || state & 1 != 0
+                    })
                     .collect();
                 down.extend(held);
             }
@@ -1199,7 +1204,8 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// 0.2 s (`VICTORY_KEYS_HOLD_MS`: that long instead, for runs at a frame a
+    /// second) that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
@@ -1229,10 +1235,14 @@ mod host {
             });
             (Instant::now(), keys.collect())
         });
+        static HOLD: LazyLock<Duration> = LazyLock::new(|| {
+            let ms = std::env::var("VICTORY_KEYS_HOLD_MS").ok().and_then(|v| v.parse().ok());
+            Duration::from_millis(ms.unwrap_or(200))
+        });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .filter(|&&(at, _)| (at..at + *HOLD).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
     }
