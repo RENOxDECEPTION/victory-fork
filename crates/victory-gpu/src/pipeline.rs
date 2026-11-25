@@ -83,6 +83,9 @@ pub(crate) struct Shader {
     /// A compute program's thread group size, as the console runs it.
     #[cfg(windows)]
     group: OnceLock<Option<[u32; 3]>>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -143,6 +146,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 limited_twin: OnceLock::new(),
                 #[cfg(windows)]
                 group: OnceLock::new(),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
             })
         })
         .clone()
@@ -233,6 +240,7 @@ impl Shader {
                     limited_twin: OnceLock::new(),
                     group: OnceLock::new(),
                     walks: OnceLock::new(),
+                    resolves_light: self.resolves_light,
                 })
             })
             .clone()
