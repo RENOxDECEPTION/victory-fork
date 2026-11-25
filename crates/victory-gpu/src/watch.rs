@@ -726,6 +726,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let mut written = Vec::new();
+    let lazy = alias_lazy();
+    // Blocks noted clean without a protect call (`VICTORY_ALIAS_LAZY`).
+    let mut regroup = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
@@ -753,6 +756,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 if g.protected.contains(&block) {
                     // Written through the runtime, still read-only.
                     g.clean.insert(block, block + 1);
+                    if lazy {
+                        regroup.push(block);
+                    }
                 } else {
                     run.get_or_insert(block);
                     continue;
@@ -765,6 +771,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if let Some(begin) = run {
             protect(&mut g, begin, to);
         }
+    }
+    if !regroup.is_empty() {
+        reprotect_groups(&mut g, &regroup);
     }
     Some(written)
 }
@@ -824,6 +833,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    let lazy = alias_lazy();
+    let mut pending = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -841,10 +852,93 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block {
-                    protect_alias(g, alias);
+                    if lazy {
+                        pending.push(alias);
+                    } else {
+                        protect_alias(g, alias);
+                    }
                 }
             }
         }
+    }
+    protect_aliases(g, pending);
+}
+
+/// Whether opening a block leaves its other views read-only, only noted
+/// not clean (`VICTORY_ALIAS_LAZY=1`; off by default).
+///
+/// Invariant: for every aliased group, either all its members are
+/// read-only or none is noted clean. `open` keeps the group and only
+/// removes the clean notes of the read-only members (no syscall); `guard`,
+/// whenever it notes a block clean without guarding it afresh, makes the
+/// group's writable members read-only again ([`reprotect_groups`], runs of
+/// adjacent blocks in one call); `protect` already does so for the rest.
+fn alias_lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_LAZY").is_some_and(|v| v == "1"))
+}
+
+/// Makes the writable other views of the pages of `blocks` read-only
+/// again, as `protect` does (`VICTORY_ALIAS_LAZY`).
+fn reprotect_groups(g: &mut Guards, blocks: &[usize]) {
+    if !view_guard() {
+        // No group can be guarded: the blocks stay not clean.
+        for &block in blocks {
+            g.clean.remove(block);
+        }
+        return;
+    }
+    let mut members = Vec::new();
+    for &block in blocks {
+        let shown = crate::inplace::pages_of(block * BLOCK);
+        if shown.len() < 2 {
+            continue;
+        }
+        if shown.len() > MANY_VIEWS {
+            // Too many views to make read-only as a group: the block stays
+            // not clean, so its next guard reports it written.
+            g.clean.remove(block);
+            continue;
+        }
+        g.aliased.insert(block);
+        for alias in shown {
+            let alias = alias / BLOCK;
+            g.aliased.insert(alias);
+            if alias != block {
+                members.push(alias);
+            }
+        }
+    }
+    protect_aliases(g, members);
+}
+
+/// [`protect_alias`] for many blocks: the ones not read-only yet, adjacent
+/// ones in one call (block by block if that call fails).
+fn protect_aliases(g: &mut Guards, mut blocks: Vec<usize>) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks.retain(|b| !g.protected.contains(b));
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+            j += 1;
+        }
+        let (from, to) = (blocks[i], blocks[j - 1] + 1);
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        if j - i > 1 && unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) } != 0 {
+            g.protected.extend(from..to);
+            if view_known() {
+                g.viewed.extend(from..to);
+            }
+        } else {
+            for &block in &blocks[i..j] {
+                protect_alias(g, block);
+            }
+        }
+        i = j;
     }
 }
 
@@ -1000,6 +1094,26 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         return any;
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    if alias_lazy() {
+        // The other views stay read-only and lose their clean note: the
+        // next `guard` reports such a block as written, with no syscall,
+        // and a write through one of them faults once and opens it. The
+        // group is kept (`aliased` is not touched): `guard` makes its
+        // writable members read-only again when it notes any of them clean.
+        let range = start / BLOCK..end.div_ceil(BLOCK);
+        for block in aliased {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                // Blocks of the range itself were opened above.
+                if !range.contains(&alias) && g.clean.contains(&alias) {
+                    g.clean.remove(alias);
+                    #[cfg(feature = "diagnostics")]
+                    ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        return any;
+    }
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {

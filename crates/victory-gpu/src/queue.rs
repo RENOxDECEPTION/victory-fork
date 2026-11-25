@@ -527,6 +527,12 @@ fn worker() {
     loop {
         {
             let mut work = lock(&WORK.0);
+            if !*work && crate::host::sweep_idle_on() {
+                // Nothing queued: the idle gap (`VICTORY_SWEEP_IDLE`).
+                drop(work);
+                crate::host::sweep_idle();
+                work = lock(&WORK.0);
+            }
             while !*work {
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }

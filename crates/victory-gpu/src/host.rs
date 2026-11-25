@@ -181,12 +181,13 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
-fn sweep() {
+/// Returns whether it ran (not held off by its own once-a-second gate).
+fn sweep() -> bool {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
-        return;
+        return false;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
@@ -196,12 +197,110 @@ fn sweep() {
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
-        return;
+        return false;
     }
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    true
+}
+
+/// `VICTORY_SWEEP_IDLE=1`: the once-a-second sweep runs from the submit
+/// worker's idle gap ([`sweep_idle`]) instead of at the start of a
+/// submission, and retired objects are dropped by a thread of their own
+/// ([`reap`]) so their release (the kernel's free of the allocation) stays
+/// off the submit and landing threads. Off by default. Needs
+/// `VICTORY_ASYNC_SUBMIT=1` for the sweep half.
+pub(crate) fn sweep_idle_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_IDLE").is_some_and(|v| v == "1"))
+}
+
+/// When a sweep last had its chance (milliseconds since the first call).
+static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When the worker's idle sweep last ran (0: not yet, so the submission
+/// keeps sweeping until it has).
+static IDLE_SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by the submit worker when it has nothing queued: sweeps if no
+/// submission is being prepared and nothing is in the air, which is what
+/// the sweep at the start of a submission waits for. A submission that
+/// comes meanwhile waits on the submission lock. If the chances stop for a
+/// second and a half the submission sweeps as before.
+pub(crate) fn sweep_idle() {
+    if !sweep_idle_on() || flying() {
+        return;
+    }
+    let Some(host) = host() else { return };
+    let Ok(_submitted) = host.submitted.try_lock() else {
+        return;
+    };
+    // Looked at again under the lock: nothing starts or lands now.
+    if flying() || STARTED.load(Ordering::Acquire) > FINISHED.load(Ordering::Acquire) {
+        return;
+    }
+    // Stamped only when the sweep ran, not when its own gate held it off.
+    if sweep() {
+        let now = now_ms().max(1);
+        SWEPT.store(now, Ordering::Relaxed);
+        IDLE_SWEPT.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Whether the worker's idle sweep has run lately, so the submission
+/// leaves the sweep to it.
+fn swept_idle() -> bool {
+    if !sweep_idle_on() || !crate::queue::behind() {
+        return false;
+    }
+    let at = IDLE_SWEPT.load(Ordering::Relaxed);
+    at != 0 && now_ms() < at + 1500
+}
+
+/// Takes the synchronous accounting of an object about to be reaped (the
+/// card budget, the host texture counts, the tiles) off its books now, so
+/// only the kernel's free is left to the reaper thread. Only for the last
+/// holder: otherwise the object lives on and keeps what it counts. Each
+/// `uncount` works once, so the later `Drop` does not repeat it.
+fn uncount(object: &dyn std::any::Any) {
+    use std::sync::Arc;
+    if let Some(s) = object.downcast_ref::<Arc<crate::shadow::Shadow>>() {
+        if Arc::strong_count(s) == 1 {
+            s.uncount();
+        }
+    } else if let Some(h) = object.downcast_ref::<Arc<crate::resource::HostTexture>>() {
+        if Arc::strong_count(h) == 1 {
+            h.uncount();
+        }
+    } else if let Some(t) = object.downcast_ref::<Arc<crate::resource::Twin>>()
+        && Arc::strong_count(t) == 1
+    {
+        for h in std::iter::once(&t.colour).chain(t.plane.as_ref()) {
+            if Arc::strong_count(h) == 1 {
+                h.uncount();
+            }
+        }
+    }
+}
+
+/// Sends what is retired to the thread that drops it (a thread that lives
+/// as long as the process: the sender is kept in a static).
+fn reap(retired: Retired) {
+    uncount(&*retired.0);
+    static REAPER: OnceLock<std::sync::mpsc::Sender<Retired>> = OnceLock::new();
+    let sender = REAPER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Retired>();
+        let _ = std::thread::Builder::new().name("victory-reap".into()).spawn(move || {
+            // Lives as long as the process; each object is dropped as it comes.
+            while let Ok(retired) = receiver.recv() {
+                drop(retired);
+            }
+        });
+        sender
+    });
+    // A failed send hands the object back: dropped here, as without the thread.
+    let _ = sender.send(retired);
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -210,7 +309,12 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if sweep_idle_on() {
+            // Counted off in `reap`, before the object is handed over.
+            reap(Retired(Box::new(object)));
+        } else {
+            drop(object);
+        }
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -233,7 +337,13 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    if sweep_idle_on() {
+        for (_, retired) in done {
+            reap(retired);
+        }
+    } else {
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -5477,8 +5587,9 @@ impl Host {
         // of is named by no list, and nothing runs now (behind flights the
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
-        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !behind {
+        if swept_idle() {
+            // The worker's idle gap sweeps (`VICTORY_SWEEP_IDLE`).
+        } else if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {

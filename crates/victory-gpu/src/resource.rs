@@ -1132,6 +1132,8 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// Taken off the counts already ([`HostTexture::uncount`]).
+    uncounted: std::sync::atomic::AtomicBool,
     /// Made without memory of its own (`crate::tiles`): the tiles its
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
@@ -1962,6 +1964,7 @@ impl HostTexture {
             flags,
             bytes,
             filled: false,
+            uncounted: std::sync::atomic::AtomicBool::new(false),
             tiled: None,
         }
     }
@@ -1982,6 +1985,7 @@ impl HostTexture {
             flags,
             bytes: 0,
             filled: false,
+            uncounted: std::sync::atomic::AtomicBool::new(false),
             tiled: Some(tiled),
         }
     }
@@ -1990,12 +1994,28 @@ impl HostTexture {
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
+        self.uncount();
+    }
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// Takes the texture off the counts and gives its tiles back, once (also
+    /// called ahead of the drop when the release is left to the reaper
+    /// thread, `VICTORY_SWEEP_IDLE`).
+    pub(crate) fn uncount(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        if self.uncounted.swap(true, Relaxed) {
+            return;
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if let Some(tiled) = &self.tiled {
+            tiled.release_tiles();
         }
     }
 }
