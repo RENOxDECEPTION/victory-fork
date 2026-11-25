@@ -3382,6 +3382,7 @@ impl Shadow {
         use crate::census::{OwnCount, own_count};
         own_count(OwnCount::Runs, runs.len() as u64);
         own_count(OwnCount::RunBytes, bytes as u64);
+        own_count(OwnCount::Pieces, 1);
         own_count(OwnCount::Avoided, (n - bytes) as u64);
     }
 

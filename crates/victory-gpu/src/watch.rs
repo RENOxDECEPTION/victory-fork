@@ -1253,7 +1253,6 @@ pub(crate) fn fault_write(at: usize) -> bool {
 /// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`
 /// with `MEM_COMMIT`): its blocks are no longer absent.
 pub fn title_memory_committed(at: usize, len: usize) {
-    crate::shadow::own_forget(at, len);
     let mut g = guards();
     if g.absent.is_empty() {
         return;

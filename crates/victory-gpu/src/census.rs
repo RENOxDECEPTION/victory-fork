@@ -121,8 +121,9 @@ pub(crate) enum OwnCount {
     /// CPU writes to owned pieces sent up by changed runs: runs and bytes.
     Runs,
     RunBytes,
-    /// Bytes of owned pieces refreshed without going up (a whole-piece
-    /// upload would have sent them).
+    /// Owned pieces refreshed by changed runs, not uploaded whole, and
+    /// the bytes of them that did not go up.
+    Pieces,
     Avoided,
     /// Pieces fetched for a reader of ours, and their bytes; the settles
     /// of flights that took.
@@ -137,7 +138,7 @@ pub(crate) enum OwnCount {
 }
 
 #[cfg(feature = "diagnostics")]
-static OWN_COUNTS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static OWN_COUNTS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Adds `n` to an [`OwnCount`] (diagnostics).
 pub(crate) fn own_count(c: OwnCount, n: u64) {
@@ -161,8 +162,8 @@ pub(crate) fn own_say() {
         }
         let c: Vec<u64> = OWN_COUNTS.iter().map(|c| c.swap(0, Relaxed)).collect();
         tracing::info!(
-            "VICTORY_OWN=wc in 5 s: {} pieces ({} MB) left on the card; {} changed runs ({} KB) sent up to owned pieces, {} MB of whole-piece upload avoided; {} pieces ({} KB) fetched for readers of ours, {} settles for them; came back as before: {} aliased, {} read by us, {} in descriptor heaps",
-            c[0], c[1] >> 20, c[2], c[3] >> 10, c[4] >> 20, c[5], c[6] >> 10, c[7], c[8], c[9], c[10]
+            "VICTORY_OWN=wc in 5 s: {} pieces ({} MB) left on the card; {} changed runs ({} KB) sent up to owned pieces, {} whole-piece uploads avoided ({} MB not sent); {} pieces ({} KB) fetched for readers of ours, {} settles for them; came back as before: {} aliased, {} read by us, {} in descriptor heaps",
+            c[0], c[1] >> 20, c[2], c[3] >> 10, c[4], c[5] >> 20, c[6], c[7] >> 10, c[8], c[9], c[10], c[11]
         );
     }
 }
