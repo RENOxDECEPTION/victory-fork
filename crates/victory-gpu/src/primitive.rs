@@ -129,6 +129,9 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if exp == 143 && man != 0 {
+        return sign | 0x7e00; // NaN stays NaN
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }

@@ -590,8 +590,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
         39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
-        19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
-        44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
+        19..=21 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        // X32_TYPELESS_G8X24_UINT: the stencil is the second dword's low byte.
+        22 => (8, Box::new(move |b| [f32::from(b[4]); 3])),
+        44..=46 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
+        // X24_TYPELESS_G8_UINT: the stencil is the top byte.
+        47 => (4, Box::new(move |b| [f32::from(b[3]); 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
         55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),

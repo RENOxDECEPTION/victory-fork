@@ -5889,14 +5889,21 @@ impl<'a> Lower<'a> {
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
-    // shortcut: the descriptor's channel swizzle is taken as the identity
-    // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
+    /// typed loads do (channels past the format's read 0, 0, 0, 1), then
+    /// picked by `sel`, the descriptor's DST_SEL (3 bits per result channel:
+    /// 0 zero, 1 one, 4-7 x-w).
+    // shortcut: elements of 4 bytes or more are taken as dword-aligned. Norm formats divide, which the AMD
     // driver does 1 ULP off the hardware's correctly rounded conversion for
     // some values; correct it with an integer check if a title compares
     // converted values exactly.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    fn format_load(
+        &mut self,
+        h: V,
+        off: V,
+        format: u8,
+        channels: u32,
+        sel: u32,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
@@ -6001,11 +6008,17 @@ impl<'a> Lower<'a> {
             Numeric::Uint | Numeric::Sint => 1,
             _ => 1.0f32.to_bits(),
         };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(one));
+        while out.len() < 4 {
+            out.push(if out.len() == 3 { one } else { zero });
         }
-        out.truncate(channels as usize);
-        Ok(out)
+        Ok((0..channels)
+            .map(|i| match sel >> (3 * i) & 7 {
+                1 => one,
+                s @ 4..=7 => out[(s - 4) as usize],
+                _ => zero,
+            })
+            .collect())
     }
 
     /// The byte offset a buffer descriptor built around a root descriptor adds
@@ -10039,7 +10052,8 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // (`tbuffer_load_format_d16_*` too: typed stores are refused above.)
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -10096,10 +10110,14 @@ impl<'a> Lower<'a> {
         // table by heap slot does; the access becomes a raw one at the
         // element's byte. (Also tells the host this shader reads such
         // buffers.)
+        // Typed loads with an instruction format (`tbuffer_*`) read raw
+        // bytes too ([`Self::format_load`]); `buffer_*_format` keeps the
+        // index for its typed view.
+        let raw = !typed || format.is_some();
         let mut index = index;
         if let Some(stride) = self.slot_stride(src)?
             && let Some(element) = index
-            && !typed
+            && raw
             && used.is_none()
         {
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
@@ -10111,7 +10129,7 @@ impl<'a> Lower<'a> {
         // through a structured view gives zeros on NVIDIA), and one kind
         // of view can then serve every shader that reads the buffer.
         if let (Some(element), Some(u)) = (index, used)
-            && !typed
+            && raw
             && u.kind != ResourceType::Cbv
             && u.stride >= 4
             && u.stride.is_multiple_of(4)
@@ -10370,7 +10388,42 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            // The descriptor's DST_SEL (dword 3, bits 11:0) where the code
+            // fixes it; x, y, z, w for descriptors read from memory.
+            let sel = match src {
+                Source::Built { words, .. } => words[1] & 0xFFF,
+                Source::Constant(w) if w.len() > 3 => w[3] & 0xFFF,
+                _ => 0xFAC,
+            };
+            let xs = self.format_load(h, off, f, count, sel)?;
+            if !d16 {
+                for (k, x) in xs.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
+            // d16: two 16-bit channels per VGPR, low half first (an odd last
+            // high half 0). Float and norm channels become f16.
+            // ponytail: integer channels keep their low 16 bits; clamp if a
+            // title reads out-of-range 32-bit integers through d16.
+            let int = matches!(buffer_format(f), Some((_, Numeric::Uint | Numeric::Sint)));
+            let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+            let i32t = self.s.t.i32;
+            let mut halves = Vec::new();
+            for x in xs {
+                halves.push(if int {
+                    self.s.m.bin(c, Bin::And, x, low)
+                } else {
+                    let f = self.as_float(x);
+                    self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                });
+            }
+            for (k, pair) in halves.chunks(2).enumerate() {
+                let mut x = pair[0];
+                if let Some(&hi) = pair.get(1) {
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    x = self.s.m.bin(c, Bin::Or, x, hi);
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
