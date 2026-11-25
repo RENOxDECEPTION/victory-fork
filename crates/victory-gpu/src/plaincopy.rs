@@ -145,7 +145,22 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         const READ: usize = 0;
+        const WRITE: usize = 1;
         let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
+        // A write that faults, with a title destination ([`copy_title`]):
+        // a guarded block is opened and the copy goes on where it stood;
+        // a page that is not there ends it like a missing source page.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] == WRITE
+            && TITLE_DST.get()
+        {
+            if crate::watch::fault_write(r.ExceptionInformation[1]) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
         if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
             context.Rip = (&raw const victory_copy_guarded_fault) as u64;
@@ -179,6 +194,46 @@ fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
 #[cfg(not(target_arch = "x86_64"))]
 fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
+}
+
+thread_local! {
+    /// This thread is in a copy whose destination is title memory
+    /// ([`copy_title`]): a write fault in the copy is taken.
+    static TITLE_DST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the title's own buffer copies and fills are made in place too,
+/// whatever their size and with title memory as the destination
+/// (`VICTORY_COPY_TITLE=1`, with [`on`]; off by default).
+///
+/// [`copy`] leaves reads under 256 bytes and every copy into title memory
+/// to the kernel. The title's buffer copies are both: 13,000 a frame, 350
+/// bytes each on average, 6 ms a frame of our submit thread in
+/// `ZwReadVirtualMemory` (RTX 5090, steady scene of the first room).
+pub(crate) fn title_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_COPY_TITLE").is_some_and(|v| v == "1"))
+}
+
+/// With [`title_copies`]: a copy of the title's own (`crate::host::copy_mapped`)
+/// in place, `to` host memory or title memory the guards were opened on.
+/// False if it is off or a page of either was not there (some of `to` may
+/// have been written): the caller copies through the kernel.
+pub(crate) fn copy_title(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !title_copies() || len == 0 || faulted_lately(from as usize, len) {
+        return false;
+    }
+    TITLE_DST.set(true);
+    let whole = guarded(to, from, len);
+    TITLE_DST.set(false);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
 }
 
 /// With [`on`]: copies title memory at `from` into host memory at `to`;

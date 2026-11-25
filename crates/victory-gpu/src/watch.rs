@@ -614,6 +614,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
+        if open && absent_told() && g.absent.contains(&block) {
+            // Still absent: the runtime would have said otherwise.
+            open = false;
+        }
         if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
@@ -793,6 +797,42 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.absent.insert(block);
         }
     }
+}
+
+/// A write at `at` faulted in a copy of ours into title memory
+/// (`crate::plaincopy::copy_title`): whether it can go on, the block's
+/// guard opened or the memory writable after all.
+pub(crate) fn fault_write(at: usize) -> bool {
+    let mut g = guards();
+    open(&mut g, at, at + 1) || writable(at)
+}
+
+/// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`
+/// with `MEM_COMMIT`): its blocks are no longer absent.
+pub fn title_memory_committed(at: usize, len: usize) {
+    let mut g = guards();
+    if g.absent.is_empty() {
+        return;
+    }
+    let blocks: Vec<usize> = g.absent.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in blocks {
+        g.absent.remove(&block);
+    }
+}
+
+/// Whether a block noted absent is taken as absent until the runtime says
+/// it committed or mapped it (`VICTORY_ABSENT_TOLD=1`; off by default).
+///
+/// A range with absent blocks asked the system at every refresh whether
+/// they were still uncommitted (`uncommitted_end`, a walk of the page
+/// tables): 10 ms a frame of our submit thread in `NtQueryVirtualMemory`
+/// under `guard` (RTX 5090, steady scene of the first room, 135 ms a
+/// frame). The title commits memory through `XMemVirtualAlloc` alone and
+/// maps pages through the runtime, and both tell us
+/// ([`title_memory_committed`], [`title_memory_remapped`]).
+fn absent_told() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_TOLD").is_some_and(|v| v == "1"))
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.

@@ -162,6 +162,11 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // The GPU side's guards note uncommitted blocks as absent and, told
+    // of every commit, need not ask the system whether they still are.
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     at
 }
 
