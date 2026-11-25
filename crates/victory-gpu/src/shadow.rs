@@ -1805,6 +1805,16 @@ pub(crate) fn merge_settle_stats() -> [u64; 4] {
     [0, 1, 2, 3].map(|i| MERGE_SETTLES[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, of the settles for the changed-runs cap
+/// (`runs_left`): the changed runs counted there, their sum, the settles,
+/// the most runs in one, and the largest copy that settled that way.
+static OVER_CAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`OVER_CAP`], taken: sum of runs, settles, largest runs, largest copy.
+pub(crate) fn over_cap_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| OVER_CAP[i].swap(0, Ordering::Relaxed))
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -3054,6 +3064,10 @@ impl Shadow {
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
                         MERGE_SETTLES[2].fetch_add(1, Ordering::Relaxed);
+                        OVER_CAP[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        OVER_CAP[1].fetch_add(1, Ordering::Relaxed);
+                        OVER_CAP[2].fetch_max(runs.len() as u64, Ordering::Relaxed);
+                        OVER_CAP[3].fetch_max(self.len, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();

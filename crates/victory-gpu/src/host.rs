@@ -3638,8 +3638,14 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
         let [unwatched, no_journal, over_cap, no_snapshot] = crate::shadow::merge_settle_stats().map(|n| n as f64 / frames);
+        let [runs_sum, runs_settles, runs_max, copy_max] = crate::shadow::over_cap_stats();
+        let runs_avg = if runs_settles > 0 { runs_sum as f64 / runs_settles as f64 } else { 0.0 };
+        let copy_mb = copy_max as f64 / (1 << 20) as f64;
         tracing::info!(
-            "settles asked for by the merge under flights per frame, by cause: memory not write-watched {unwatched:.2},              no journal of writes {no_journal:.2}, over the changed-runs cap (VICTORY_MERGE_RUNS) {over_cap:.2},              no snapshot for a copy outside the card {no_snapshot:.2}"
+            "settles asked for by the merge under flights per frame, by cause: memory not write-watched {unwatched:.2}, \
+             no journal of writes {no_journal:.2}, over the changed-runs cap (VICTORY_MERGE_RUNS) {over_cap:.2} per frame \
+             (runs avg {runs_avg:.0} max {runs_max}, copy max {copy_mb:.2} MB), \
+             no snapshot for a copy outside the card {no_snapshot:.2}"
         );
     }
 }

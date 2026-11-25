@@ -890,6 +890,19 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
+    // Under the write lock, after the entries moved: a view read before this
+    // may name an entry that is gone now (`HostHeap::mirror`).
+    FORGETS.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Counts the `forget` calls that dropped entries. A view `HostHeap::mirror`
+/// keeps for the lock-free path is current only while this has not moved.
+static FORGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current [`FORGETS`] count.
+#[cfg(windows)]
+pub(crate) fn forgets() -> u64 {
+    FORGETS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The view the record words `i` and `generation` name: the one they hold

@@ -169,6 +169,15 @@ fn tables() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TABLE").is_some_and(|v| v == "1"))
 }
 
+/// Whether a dropped stage of the ray-tracing structure builder is dropped
+/// before the window and the list's gathering are ended
+/// (`VICTORY_RT_DROP_EARLY=1`; off by default). Such a dispatch writes
+/// nothing, so the windows and the gathering it would have ended stay.
+fn rt_drop_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RT_DROP_EARLY").as_deref() == Ok("1"))
+}
+
 impl State {
     /// A title draw or dispatch that is not an indirect one ends a window
     /// of records clamped ahead; a job table stays (see `Window::writes`).
@@ -2248,6 +2257,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // A dropped stage of the structure builder writes nothing, so with
+        // VICTORY_RT_DROP_EARLY it ends neither the window nor the gathering.
+        let dropped = rt_drop_early() && crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs();
+        if dropped {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                self.list_dropped_roots([x, y, z]);
+            }
+            return;
+        }
         // It may write the arguments a window holds clamped.
         self.end_window();
         list.gather_close();
