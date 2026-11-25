@@ -46,7 +46,14 @@ take, so they cannot be split into two host waves with group barriers alone.
 
 - `VICTORY_WAVE_WIDE=1` (off by default) gets the four single-wave groups to
   32-lane waves that validate and that D3D12 accepts. Upstream turned it off
-  after runs 121-124 lost the card. Next: a live run with it on.
+  after runs 121-124 lost the card. **It loses the card on the 5090 too**
+  (scored run of 2026-11-25): DXGI device removed (0x887A0006, exit
+  0x887A0005) about 60 s after 369cbe906ea72764 and 2cc4c197ee29e291 were
+  first bound (frame 1696); the other two were not bound yet. Leave it off.
+  Next step for these four: run each wide form on its own under the debug
+  layer and DRED breadcrumbs (the run logged "no breadcrumbs") to find the
+  command that hangs, likely a group barrier inside a branch or loop that
+  the two host waves reach a different number of times.
 - The three groups of several console waves are refused by `widen` on
   purpose: a group barrier inside a branch that different console waves take
   differently would hang the group. Making that work needs the branch decided
