@@ -263,6 +263,9 @@ struct Lower<'a> {
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
+    /// With `exchange`: first-lane reads that need nothing from the other host wave, by the
+    /// value they write ([`super::group_reach::own_first_reads`]).
+    own_first: HashSet<Value>,
     /// The console lane (0..63) of this thread, made in the entry block.
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
@@ -361,61 +364,12 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
-    }
+    let mut regions = super::group_reach::branch_regions(st)?;
+    regions.retain(|&(d, _)| {
+        let LaneExit::Branch { when, .. } = st.exits[d] else { return false };
+        // (a wave-wide or uniform branch: all lanes go the same way)
+        !(st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))))
+    });
     Some(regions)
 }
 
@@ -1680,7 +1634,8 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    // (with several console waves in a group: also every console wave alike)
+                    if let Some(all) = all_lane_blocks(x.st).map(|all| super::group_reach::narrow(all, p, x.st, &cs)) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -1900,7 +1855,12 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                // (alike in the lanes of one console wave: the blocks before `group_reach`)
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, &all_lane_blocks(x.st).unwrap_or_else(|| all.clone())),
+                _ => HashSet::new(),
+            },
+            own_first: match &exchange {
+                Some((_, false, _)) if !LOCAL_WAVES.get() => super::group_reach::own_first_reads(p, x.st),
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -8018,6 +7978,10 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
+                        // (where every lane of the read's guard holds the value: `own_first`)
+                        if inst.writes.first().is_some_and(|w| self.own_first.contains(&w.1)) {
+                            return int(self, mine);
+                        }
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
