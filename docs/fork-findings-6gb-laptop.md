@@ -18,8 +18,8 @@ captures (none of which are in the repository: see
 ```powershell
 cargo build --release -p victory
 # once per build of victory.exe (the shader cache is keyed by its hash):
-target\release\victory.exe translate <the title's shader archive> --warm
-target\release\victory.exe translate <game dir>\XboxBvhBuilder.dll --warm
+target\release\victory.exe translate <the title's shader archive> --warm all
+target\release\victory.exe translate <game dir>\XboxBvhBuilder.dll --warm all
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
