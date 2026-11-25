@@ -134,6 +134,58 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// With [`tables`]: the CPU address of the window's job table (0: not
+    /// a table). `records` are then the jobs in it, record `i` clamped at
+    /// `i * crate::indirect::TABLE_STRIDE` of the scratch buffer.
+    table: usize,
+    /// With a table: how often the list's shaders had been given the copy
+    /// to write when the table was opened (`HostList::writes_to`). A table
+    /// outlives the title's dispatches and draws while that stands: none
+    /// of them can have written its records.
+    writes: u32,
+}
+
+/// Whether single indirect records are clamped through a job table
+/// (`VICTORY_INDIRECT_TABLE=1`; off by default; instead of [`windows`]).
+///
+/// A window guesses which records the next draws will read (the ones a
+/// step apart) and clamps them ahead; that left about half of the clamps
+/// standing (5,128 to 2,545 a frame on an RTX 5090). Here nothing is
+/// guessed: the first such draw records one clamp pass over a table of
+/// jobs that is still empty, and every draw after it adds its own record
+/// to the table on the CPU (any offset of the same host copy, any kind, up
+/// to `crate::indirect::TABLE_JOBS`) and draws from its slot of the
+/// scratch buffer. The card reads the table when the list runs, when it is
+/// complete. A table ends at an indirect call it cannot take, at a record
+/// of another host copy, when it is full, and when the list's shaders
+/// were given its copy to write; not at the title's other draws and
+/// dispatches (about 1,040 passes a frame for 5,100 records).
+///
+/// Measured on an RTX 5090, steady scene of the first room, with the
+/// budget in the card's memory: 237 ms a frame with a pass per record,
+/// 179 ms with tables, 177 ms with no clamp at all.
+fn tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TABLE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dropped stage of the ray-tracing structure builder is dropped
+/// before the window and the list's gathering are ended
+/// (`VICTORY_RT_DROP_EARLY=1`; off by default). Such a dispatch writes
+/// nothing, so the windows and the gathering it would have ended stay.
+fn rt_drop_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RT_DROP_EARLY").as_deref() == Ok("1"))
+}
+
+impl State {
+    /// A title draw or dispatch that is not an indirect one ends a window
+    /// of records clamped ahead; a job table stays (see `Window::writes`).
+    fn end_window(&mut self) {
+        if self.window.as_ref().is_some_and(|w| w.table == 0) {
+            self.window = None;
+        }
+    }
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -238,6 +290,37 @@ fn jump_windows() -> bool {
     }
 }
 
+/// Whether a single record that misses its window is gathered: given a
+/// slot that the list's prelude fills in one pass with the list's other
+/// such records, in place of a pass of ours in front of its draw
+/// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log).
+/// Off by default. Needs [`windows`].
+fn gathers() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "single indirect records are gathered for their list's prelude from now (VICTORY_INDIRECT_GATHER=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// The records of a window opened at a remembered step ([`jump_windows`]):
 /// what the record after a lone one opens.
 const WINDOW_JUMP: u32 = 16;
@@ -265,18 +348,23 @@ fn jump_window(remembered: Option<(u64, u32, u32, u32)>, (copy, kind, stride): (
 /// ended); its record does not continue the window's walk; it is past the
 /// window's end (the next window: as meant). And the records those passes
 /// clamped in all; the passes that opened a window at a remembered step
-/// ([`jump_windows`]), and those of them no draw read from.
+/// ([`jump_windows`]), and those of them no draw read from; the commands
+/// that read a gathered record ([`gathers`]: no pass of ours either), and
+/// those that asked for one and got none (the list no longer gathers, or
+/// its set is full).
 #[cfg(feature = "diagnostics")]
-pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 
 /// The line of [`WINDOW_WHY`], per frame over `frames` frames.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_line(frames: f64) {
     let n: Vec<f64> = WINDOW_WHY.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    let g: Vec<f64> = crate::indirect::GATHER_NONE.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     tracing::info!(
         "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
          buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
-         {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw",
+         {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw; \
+         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0})",
         n[0],
         n[1..9].iter().sum::<f64>(),
         n[1],
@@ -290,6 +378,13 @@ pub(crate) fn window_line(frames: f64) {
         n[9],
         n[10],
         n[11],
+        n[12],
+        n[13],
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        g[4],
     );
 }
 
@@ -1024,11 +1119,13 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
-                continue;
-            }
+        // Only the slots the layout reads: most use one or two of 32.
+        let mut bits = p.slots;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
             count = slot + 1;
+            let (view, v) = (&mut views[slot], self.vertex[slot]);
             if v.address == 0 || v.size == 0 {
                 continue;
             }
@@ -2321,10 +2418,32 @@ impl State {
         });
     }
 
+    /// Whether the shaders of the pipeline bound now can store to buffers
+    /// (or the pipeline is not known): a draw with them may write the
+    /// arguments of draws after it, which ends a list's gathering
+    /// (`crate::indirect::gather`). The same test keeps such a draw out of
+    /// a window ([`windows`]).
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // A dropped stage of the structure builder writes nothing, so with
+        // VICTORY_RT_DROP_EARLY it ends neither the window nor the gathering.
+        let dropped = rt_drop_early() && crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs();
+        if dropped {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                self.list_dropped_roots([x, y, z]);
+            }
+            return;
+        }
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.end_window();
+        list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2714,7 +2833,10 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.end_window();
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3105,7 +3227,10 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window();
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3175,6 +3300,9 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
+            // Read at submission, where nothing is fetched for it
+            // (`VICTORY_OWN=wc`).
+            crate::shadow::own_read(from, n * 3 * stride);
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -3210,7 +3338,10 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window();
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3351,7 +3482,7 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let windowed = (windows() || tables())
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3361,6 +3492,11 @@ impl State {
         let first_on_list = list.first_use(WINDOW_USE);
         if !windowed || first_on_list {
             self.window = None;
+        }
+        if !windowed {
+            // A dispatch, or shaders that store to buffers: arguments may
+            // be written from here on.
+            list.gather_close();
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
@@ -3391,8 +3527,18 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
+        // A record that misses its window: a slot the list's prelude fills,
+        // if the list still gathers ([`gathers`]).
+        let gathered = if hit.is_none() && windowed && gathers() {
+            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
+            #[cfg(feature = "diagnostics")]
+            WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            slot
+        } else {
+            None
+        };
+        let (bounded, at) = match (hit, gathered) {
+            (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3417,7 +3563,19 @@ impl State {
                 }
                 (scratch, at)
             }
-            None => {
+            (None, Some((scratch, at))) => {
+                // The record's bytes are up to date when the list is
+                // submitted, as for a record clamped in the list.
+                args.refresh(list, arguments, len);
+                // Diagnostics of windows, for gathered records too: the
+                // record clamped again here and compared.
+                if crate::indirect::window_check() && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at) {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (scratch, at)
+            }
+            (None, None) => {
                 // A window opened at the remembered step that no draw read
                 // from: the title does not walk here by that step.
                 if self.window_jumped && !self.window_read {
@@ -3519,6 +3677,8 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    table: 0,
+                    writes: 0,
                 });
                 (bounded, 0)
             }

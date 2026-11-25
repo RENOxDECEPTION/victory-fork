@@ -465,6 +465,37 @@ pub(crate) fn release_held(all: bool) {
 /// it, some milliseconds later. On the console the card reads that
 /// memory when it runs the list, later still, so a title that rewrote it
 /// earlier would be wrong there too.
+/// The most of the title's submissions our thread prepares and sends as
+/// one host submission (`VICTORY_BATCH_SUBMIT=N`, with [`behind`]; 1, the
+/// default: each on its own).
+///
+/// The title submits some thirty times a frame, and our thread prepared
+/// each on its own: every one asked the write watch and walked the guards
+/// for every range its lists read (the world's 174 MB heap sixteen times a
+/// frame), synchronized the descriptor heaps, and sent the card a list of
+/// ours that brings its copies up to date and hashes them (2.1 ms of the
+/// card each, RTX 5090) and another that compares them. Our thread was at
+/// work 103 ms of a 132 ms frame while the title's submitting thread stood
+/// behind it, and by the time it reached a submission the title had queued
+/// the ones after it.
+///
+/// With the switch, when our thread takes a submission off a queue's line
+/// it takes the submissions directly behind it too (signals between them
+/// are passed over; a wait, a present or anything else ends the run) and
+/// prepares them as one: one asking, one sync, one pair of card lists.
+/// The signals passed over are set after the whole, later than each on
+/// its own and never earlier.
+///
+/// What it assumes is what [`behind`] assumes already: title memory a
+/// submission reads stays as it was until the submission's fence is
+/// signalled. A fence the title waits on from another thread is signalled
+/// later by the preparing of the submissions that joined.
+#[cfg(windows)]
+fn batch_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_BATCH_SUBMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1).max(1))
+}
+
 #[cfg(windows)]
 pub(crate) fn behind() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -496,6 +527,12 @@ fn worker() {
     loop {
         {
             let mut work = lock(&WORK.0);
+            if !*work && crate::host::sweep_idle_on() {
+                // Nothing queued: the idle gap (`VICTORY_SWEEP_IDLE`).
+                drop(work);
+                crate::host::sweep_idle();
+                work = lock(&WORK.0);
+            }
             while !*work {
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
@@ -788,7 +825,82 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(mut lists, mut order) => {
+                        // The submissions queued right behind this one go
+                        // with it ([`batch_most`]); the signals between
+                        // them follow the whole.
+                        if behind() && !all && batch_most() > 1 {
+                            let mut runs = 1;
+                            let mut last = None;
+                            // What ended the run of submissions (diagnostics).
+                            static ENDED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+                            let mut ended = 0;
+                            for (k, h) in held.iter().enumerate() {
+                                match h {
+                                    Held::Signal(..) => {}
+                                    Held::Run(..) if runs < batch_most() => {
+                                        runs += 1;
+                                        last = Some(k);
+                                    }
+                                    // A wait for a value that memory holds, or
+                                    // that a submission of the run writes when
+                                    // it has run (as `crate::host::late_met`
+                                    // has it for flights): what follows it
+                                    // goes to the card behind that submission,
+                                    // the order the wait asks for.
+                                    Held::Value(wait)
+                                        if wait.met()
+                                            || lists.iter().any(|l| l.host().will_meet(wait))
+                                            || held[..k].iter().any(|h| matches!(h, Held::Run(l, _) if l.iter().any(|l| l.host().will_meet(wait)))) => {}
+                                    other => {
+                                        ended = match other {
+                                            Held::Wait(..) => 1,
+                                            Held::Value(..) => 2,
+                                            Held::Present(..) => 3,
+                                            Held::Run(..) => 4,
+                                            _ => 5,
+                                        };
+                                        break;
+                                    }
+                                }
+                            }
+                            ENDED[ended].fetch_add(1, Ordering::Relaxed);
+                            if ENDED.iter().map(|e| e.load(Ordering::Relaxed)).sum::<u64>() % 2000 == 0 {
+                                let e: Vec<u64> = ENDED.iter().map(|e| e.swap(0, Ordering::Relaxed)).collect();
+                                tracing::info!(
+                                    "what ended a run of submissions, of 2,000: the line's end {}, a wait for a fence {}, a wait for a memory value {}, a present {}, the most {}, other {}",
+                                    e[0], e[1], e[2], e[3], e[4], e[5]
+                                );
+                            }
+                            if let Some(last) = last {
+                                let mut signals = Vec::new();
+                                for h in held.drain(0..=last) {
+                                    match h {
+                                        Held::Run(l, o) => {
+                                            let base = lists.len();
+                                            lists.extend(l);
+                                            order.extend(o.into_iter().map(|i| i + base));
+                                        }
+                                        other => signals.push(other),
+                                    }
+                                }
+                                for (k, h) in signals.into_iter().enumerate() {
+                                    held.insert(k, h);
+                                }
+                            }
+                            static BATCHES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+                            let n = BATCHES[0].fetch_add(1, Ordering::Relaxed) + 1;
+                            let all_runs = BATCHES[1].fetch_add(runs as u64, Ordering::Relaxed) + runs as u64;
+                            if n % 2000 == 0 {
+                                tracing::info!(
+                                    "submissions prepared together (VICTORY_BATCH_SUBMIT={}): {:.1} of the title's a host submission, over the last 2,000",
+                                    batch_most(),
+                                    all_runs as f64 / n as f64
+                                );
+                                BATCHES[0].store(0, Ordering::Relaxed);
+                                BATCHES[1].store(0, Ordering::Relaxed);
+                            }
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(

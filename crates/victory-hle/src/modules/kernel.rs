@@ -472,6 +472,8 @@ mod host {
     }
 
     pub(super) fn exit(code: i32) -> ! {
+        // `VICTORY_LOG_ASYNC` lines still queued would die with the process.
+        victory_core::logging::flush();
         // SAFETY: see above.
         unsafe { crt_exit(code) }
     }
@@ -570,6 +572,7 @@ mod host {
     }
 
     pub(super) fn exit(code: i32) -> ! {
+        victory_core::logging::flush();
         std::process::exit(code)
     }
 
